@@ -23,8 +23,8 @@ folder per AID.
 ## Output
 
     AID 115/
-      02-03 Survey Staking Report_Dig#02B.xlsm
       AID 115 - Dig Stake Cheat Sheet.xlsx
+      Staking Reports/02-03 Survey Staking Report_Dig#02B.xlsm
       Excavation Survey Reports/ExcavationSurvey Report_Dig 02B.pdf
       Profile Reports/Profile Dig #02B.xlsx
     AID 116/ ...
