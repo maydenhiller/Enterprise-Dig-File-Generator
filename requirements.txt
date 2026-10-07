@@ -3,3 +3,4 @@ openpyxl>=3.1.5
 pillow>=10.3
 requests>=2.32
 polyline>=2.0
+pypdf>=5.0
