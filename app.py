@@ -27,7 +27,10 @@ from __future__ import annotations
 import datetime as _dt
 import io
 import math
+import os
 import re
+import tempfile
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
@@ -469,6 +472,95 @@ class XlsmPatcher:
                 "</workbook>", '<calcPr fullCalcOnLoad="1"/></workbook>'
             )
         self.parts[path] = xml.encode("utf-8")
+
+    def keep_only_sheet(self, keep: str, rename_to: Optional[str] = None) -> None:
+        """Drop every other sheet from the workbook, optionally renaming the one kept.
+
+        Everything that belongs only to a dropped sheet (its XML, drawing,
+        relationships, defined names, calculation chain) goes with it.
+        """
+        workbook = self._text("xl/workbook.xml")
+        rels = self._text("xl/_rels/workbook.xml.rels")
+        sheets = list(re.finditer(r"<sheet\b[^>]*/>", workbook))
+        order = [re.search(r'name="([^"]*)"', m.group(0)).group(1) for m in sheets]
+        if keep not in order:
+            raise KeyError(f"No sheet named {keep!r} in this workbook")
+        keep_index = order.index(keep)
+
+        dropped_paths = []
+        for match, name in zip(sheets, order):
+            if name == keep:
+                continue
+            rid = re.search(r'r:id="([^"]*)"', match.group(0)).group(1)
+            rel = re.search(rf'<Relationship\b[^>]*Id="{rid}"[^>]*/>', rels)
+            if rel:
+                rels = rels.replace(rel.group(0), "")
+            path = self._sheet_paths.get(name)
+            if path:
+                dropped_paths.append(path)
+            workbook = workbook.replace(match.group(0), "")
+
+        # Defined names are tied to a sheet by position.
+        def fix_name(match):
+            tag = match.group(0)
+            local = re.search(r'localSheetId="(\d+)"', tag)
+            if local:
+                if int(local.group(1)) != keep_index:
+                    return ""
+                tag = tag.replace(local.group(0), 'localSheetId="0"')
+            return tag
+        workbook = re.sub(r"<definedName\b[^>]*>.*?</definedName>", fix_name, workbook, flags=re.S)
+        workbook = re.sub(r"<definedNames>\s*</definedNames>", "", workbook)
+
+        if rename_to and rename_to != keep:
+            workbook = workbook.replace(f'name="{keep}"', f'name="{escape(rename_to)}"', 1)
+            workbook = re.sub(rf"(?<![\w.]){re.escape(keep)}!", f"{rename_to}!", workbook)
+        self.parts["xl/workbook.xml"] = workbook.encode("utf-8")
+
+        # Excel rebuilds the calculation chain; a stale one names cells on dropped sheets.
+        chain = "xl/calcChain.xml"
+        if chain in self.parts:
+            rels = re.sub(r'<Relationship\b[^>]*calcChain[^>]*/>', "", rels)
+            dropped_paths.append(chain)
+        self.parts["xl/_rels/workbook.xml.rels"] = rels.encode("utf-8")
+
+        dropped = set()
+        for path in dropped_paths:
+            dropped.add(path)
+            sheet_rels = _rels_path(path)
+            if sheet_rels in self.parts:
+                dropped.add(sheet_rels)
+                for target in re.findall(r'Target="([^"]+)"', self._text(sheet_rels)):
+                    resolved = _resolve(path, target)
+                    if resolved.startswith("xl/printerSettings/") and resolved in self.parts:
+                        dropped.add(resolved)
+                    if resolved.startswith("xl/drawings/") and resolved in self.parts:
+                        dropped.add(resolved)
+                        drawing_rels = _rels_path(resolved)
+                        if drawing_rels in self.parts:
+                            dropped.add(drawing_rels)
+
+        content_types = self._text("[Content_Types].xml")
+        for path in dropped:
+            content_types = re.sub(
+                rf'<Override\b[^>]*PartName="/{re.escape(path)}"[^>]*/>', "", content_types)
+        self.parts["[Content_Types].xml"] = content_types.encode("utf-8")
+
+        for path in dropped:
+            self.parts.pop(path, None)
+        # Media that only a dropped drawing used.
+        referenced = set()
+        for name, data in self.parts.items():
+            if name.endswith(".rels"):
+                base = name.replace("_rels/", "").rsplit(".rels", 1)[0]
+                for target in re.findall(r'Target="([^"]+)"', data.decode("utf-8")):
+                    referenced.add(_resolve(base, target))
+        for name in [n for n in self.parts if n.startswith("xl/media/")]:
+            if name not in referenced:
+                dropped.add(name)
+                self.parts.pop(name, None)
+        self.names = [n for n in self.names if n not in dropped]
+        self._sheet_paths = self._map_sheets()
 
     # -- output ---------------------------------------------------------
     def to_bytes(self) -> bytes:
@@ -2321,12 +2413,290 @@ def _encode_for_slot(image_bytes: bytes, slot) -> bytes:
 
 
 # ==========================================================================
+# REPORTS
+# ==========================================================================
+# The two extra deliverables Enterprise asks for with each dig:
+#
+#   * an Excavation Survey Report - an Adobe XFA form (.pdf). Its fields live in
+#     an XML "datasets" packet inside the PDF, so filling it means replacing that
+#     packet. It is replaced with an *incremental update* appended to the end of
+#     the original file: the original bytes (and the signature that gives Adobe
+#     Reader permission to fill and save the form) are left untouched, so the
+#     dropdowns and the check box stay live and editable in Adobe.
+#   * a Profile workbook (.xlsx) - the template's blank profile sheet with the
+#     header block filled in; everything else on it is left as the template has it.
+#
+# Both read the same facts out of the dig sheet's title line, e.g.
+#   Line ID 600-601-602 / Asmt ID 116,  East Leg Mainline, 8.625"  Kearney to Moberly
+
+PIPELINE_CODE = "763"
+
+_TITLE_RE = re.compile(
+    r"Line\s*ID\s*(?P<lid>.+?)\s*/\s*Asmt\s*ID\s*(?P<aid>\d+)\s*,\s*(?P<rest>.+)$",
+    re.I | re.S,
+)
+
+
+@dataclass
+class AssetInfo:
+    """What a dig sheet's title line says about the pipeline."""
+
+    line_id: str = ""          # "600-601-602"
+    assessment_id: str = ""    # "116"
+    line_name: str = ""        # "East Leg Mainline"
+    segment_name: str = ""     # '8.625" Kearney to Moberly'
+    dig_number: str = ""       # "02A"
+
+    @property
+    def complete(self) -> bool:
+        return all((self.line_id, self.assessment_id, self.line_name, self.segment_name))
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def asset_info(dig: Dig) -> AssetInfo:
+    """Parse the title line of the dig sheet (cell A5)."""
+    info = AssetInfo(assessment_id=str(dig.package_id or ""), dig_number=dig.number or "")
+    match = _TITLE_RE.search(_squash(dig.header))
+    if not match:
+        return info
+    info.line_id = _squash(match.group("lid"))
+    info.assessment_id = match.group("aid")
+    # The line name is everything up to the next comma; the rest is the segment.
+    name, _, segment = match.group("rest").partition(",")
+    info.line_name = _squash(name)
+    info.segment_name = _squash(segment)
+    return info
+
+
+def _asset_warnings(info: AssetInfo) -> list:
+    missing = [label for label, value in (
+        ("Line ID", info.line_id), ("assessment ID", info.assessment_id),
+        ("line name", info.line_name), ("segment name", info.segment_name),
+        ("dig number", info.dig_number)) if not value]
+    if not missing:
+        return []
+    return [f"Could not read the {', '.join(missing)} from the dig sheet title, "
+            "so those fields were left blank."]
+
+
+# ---------------------------------------------------------------------------
+# Excavation Survey Report (XFA PDF)
+# ---------------------------------------------------------------------------
+
+def _xfa_datasets(reader) -> tuple:
+    """(object number, generation, current text) of the form's datasets packet."""
+    form = reader.trailer["/Root"].get("/AcroForm")
+    xfa = form.get("/XFA") if form is not None else None
+    if not xfa:
+        raise ValueError("This PDF has no XFA form data - is it the Excavation "
+                         "Survey Report template?")
+    for index in range(0, len(xfa) - 1, 2):
+        if str(xfa[index]) == "datasets":
+            reference = xfa.raw_get(index + 1) if hasattr(xfa, "raw_get") else xfa[index + 1]
+            stream = reference.get_object()
+            return reference.idnum, reference.generation, stream.get_data().decode("utf-8")
+    raise ValueError("The PDF's form has no 'datasets' packet.")
+
+
+def _stream_update_tail(original: bytes, reader, object_number: int,
+                        generation: int, data: bytes) -> bytes:
+    """The bytes to append to ``original`` to replace one stream object.
+
+    The original bytes are not touched. A new copy of the stream object and a
+    new cross-reference stream pointing at it are appended, which is how Adobe
+    products save changes to a document that has usage rights (the signature
+    covers the original bytes, and an appended update leaves that valid).
+    """
+    import struct
+
+    trailer = reader.trailer
+    size = int(trailer["/Size"])
+    previous = int(re.search(rb"startxref\s+(\d+)\s*%%EOF\s*$", original[-200:]).group(1))
+    root = trailer.raw_get("/Root") if hasattr(trailer, "raw_get") else trailer["/Root"]
+    info = trailer.raw_get("/Info") if hasattr(trailer, "raw_get") else trailer.get("/Info")
+
+    out = bytearray()
+    if not original.endswith((b"\n", b"\r")):
+        out += b"\r\n"
+
+    stream_offset = len(original) + len(out)
+    out += (f"{object_number} {generation} obj\n<</Length {len(data)}>>\nstream\n"
+            ).encode("ascii") + data + b"\nendstream\nendobj\n"
+
+    xref_number = size
+    xref_offset = len(original) + len(out)
+    rows = struct.pack(">BIH", 1, stream_offset, generation) + \
+        struct.pack(">BIH", 1, xref_offset, 0)
+
+    ids = trailer.get("/ID")
+    id_entry = b""
+    if ids:
+        id_entry = b"/ID[" + b"".join(
+            b"<" + bytes(item.original_bytes if hasattr(item, "original_bytes") else item).hex().encode() + b">"
+            for item in ids) + b"]"
+    dictionary = (
+        f"<</Type/XRef/Size {size + 1}/W[1 4 2]/Index[{object_number} 1 {xref_number} 1]"
+        f"/Root {root.idnum} {root.generation} R"
+        + (f"/Info {info.idnum} {info.generation} R" if info is not None else "")
+    ).encode("ascii") + id_entry + f"/Prev {previous}/Length {len(rows)}>>".encode("ascii")
+    out += f"{xref_number} 0 obj\n".encode("ascii") + dictionary + b"\nstream\n" + rows \
+        + b"\nendstream\nendobj\n"
+    out += f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    return bytes(out)
+
+
+def _fill_xfa_fields(datasets: str, values: dict) -> str:
+    """Set the empty (or filled) elements named in ``values`` inside <xfa:data>.
+
+    The packet also carries a data *description* section that repeats every
+    element name, empty - only the data section may be touched.
+    """
+    cut = datasets.find("<dd:dataDescription")
+    data, tail = (datasets, "") if cut < 0 else (datasets[:cut], datasets[cut:])
+    for name, value in values.items():
+        text = escape(str(value)) if value != "" else ""
+        pattern = re.compile(
+            r"<%(n)s\s*/>|<%(n)s\s*>[^<]*</%(n)s\s*>" % {"n": re.escape(name)}
+        )
+        replacement = f"<{name}>{text}</{name}>" if text else f"<{name}/>"
+        data, count = pattern.subn(lambda _m: replacement, data, count=1)
+        if count != 1:
+            raise ValueError(f"The template has no '{name}' field to fill.")
+    return data + tail
+
+
+class AppendedPdf:
+    """A filled PDF held as the template plus a few KB of appended update.
+
+    The Excavation Survey Report template is nearly 4 MB and every dig gets its
+    own copy, so keeping a hundred whole copies in memory is wasteful. The
+    template is shared and only the tail differs.
+    """
+
+    def __init__(self, template: bytes, tail: bytes):
+        self.template, self.tail = template, tail
+
+    def __len__(self) -> int:
+        return len(self.template) + len(self.tail)
+
+    def to_bytes(self) -> bytes:
+        return self.template + self.tail
+
+    def write_to(self, handle) -> None:
+        handle.write(self.template)
+        handle.write(self.tail)
+
+
+def excavation_field_values(dig: Dig) -> tuple:
+    """({xfa element: value}, warnings) for one dig."""
+    info = asset_info(dig)
+    values = {
+        "pipelineCode": PIPELINE_CODE,
+        "pipelineName": info.line_name,
+        "pipelineNumber": info.line_id,
+        "assessmentsegmentAssessmentID": info.assessment_id,
+        "assessmentsegmentName": info.segment_name,
+        "excavationNumber": info.dig_number,
+        # Each report is its own record. The template's ID is shared by every copy.
+        "excavationSurveyReportID": str(uuid.uuid4()),
+        # The template ships with another dig's remark in the comment box. Blank
+        # it - a remark about the wrong weld in a signed report is worse than none.
+        "excavationSurveyReportComment": "",
+    }
+    return values, _asset_warnings(info)
+
+
+def build_excavation_report(template_bytes: bytes, dig: Dig, lazy: bool = False) -> tuple:
+    """Return (PDF, warnings) - the template with the asset block filled in.
+
+    The PDF is ``bytes``, or an ``AppendedPdf`` when ``lazy`` is true.
+
+    The girth weld references, elevations, utilities and submit/validate boxes
+    are left blank and editable; survey accuracy stays as the template has it.
+    """
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(template_bytes))
+    number, generation, original = _xfa_datasets(reader)
+
+    values, warnings = excavation_field_values(dig)
+    updated = _fill_xfa_fields(original, values).encode("utf-8")
+    tail = _stream_update_tail(template_bytes, reader, number, generation, updated)
+    return (AppendedPdf(template_bytes, tail) if lazy else template_bytes + tail), warnings
+
+
+# ---------------------------------------------------------------------------
+# Profile workbook
+# ---------------------------------------------------------------------------
+
+PROFILE_SHEET = "Blank"
+PROFILE_SHEET_RENAMED = "Profile"
+
+
+def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
+    """Return (.xlsx bytes, warnings): the template's blank sheet, header filled in."""
+    info = asset_info(dig)
+    warnings = _asset_warnings(info)
+
+    patcher = XlsmPatcher(template_bytes)
+    names = patcher.sheet_names()
+    if PROFILE_SHEET not in names:
+        raise ValueError(f"The profile template has no '{PROFILE_SHEET}' sheet - "
+                         f"found {', '.join(names)}.")
+
+    cells = {
+        "F3": info.line_name,
+        "F4": info.segment_name,
+        "F5": (f"Line ID {info.line_id} /ASMT ID {info.assessment_id}"
+               if info.line_id and info.assessment_id else None),
+        "C9": info.dig_number or None,
+    }
+    missing = patcher.set_values(PROFILE_SHEET, cells, literal=True)
+    if missing:
+        warnings.append("Could not place these profile cells: " + ", ".join(sorted(missing)))
+
+    patcher.keep_only_sheet(PROFILE_SHEET, rename_to=PROFILE_SHEET_RENAMED)
+    patcher.force_full_recalc()
+    return patcher.to_bytes(), warnings
+
+
+# ==========================================================================
 # GENERATION
 # ==========================================================================
 # The whole run, kept out of the UI so it can be exercised by the tests.
 
 XLSM_MIME = "application/vnd.ms-excel.sheet.macroEnabled.12"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _file_part(text: str) -> str:
+    """A dig number made safe to use inside a file name."""
+    return re.sub(r'[\\/:*?"<>|]+', "-", str(text or "")).strip() or "Unknown"
+
+
+def folder_for(dig: Dig) -> str:
+    """Each assessment (AID) gets its own folder in the output."""
+    return f"AID {_file_part(dig.package_id)}"
+
+
+def staking_report_name(dig: Dig) -> str:
+    return f"{folder_for(dig)}/02-03 Survey Staking Report_Dig#{_file_part(dig.number)}.xlsm"
+
+
+def excavation_report_name(dig: Dig) -> str:
+    return (f"{folder_for(dig)}/Excavation Survey Reports/"
+            f"ExcavationSurvey Report_Dig {_file_part(dig.number)}.pdf")
+
+
+def profile_report_name(dig: Dig) -> str:
+    return f"{folder_for(dig)}/Profile Reports/Profile Dig #{_file_part(dig.number)}.xlsx"
+
+
+def cheat_sheet_name(package_id: str) -> str:
+    return f"AID {_file_part(package_id)}/AID {_file_part(package_id)} - Dig Stake Cheat Sheet.xlsx"
 
 
 @dataclass
@@ -2348,8 +2718,15 @@ def generate_files(
     options: RunOptions,
     phones: Optional[dict] = None,
     progress=None,
+    excavation_template: Optional[bytes] = None,
+    profile_template: Optional[bytes] = None,
 ) -> tuple:
-    """Return ({filename: bytes}, [issues]) for the chosen digs."""
+    """Return ({path: bytes}, [issues]) for the chosen digs.
+
+    Paths are relative to the zip root: one folder per AID, with the staking
+    reports and cheat sheet in it and the excavation and profile reports in
+    subfolders. The last two are made only when their template was uploaded.
+    """
     outputs, issues = {}, []
     slot_aspect = template_image_aspect(template_bytes)
     total = max(1, len(digs))
@@ -2387,10 +2764,30 @@ def generate_files(
             report, report_warnings = build_staking_report(
                 template_bytes, dig, settings, phones
             )
-            outputs[f"{dig.output_basename}.xlsm"] = report
+            outputs[staking_report_name(dig)] = report
             issues.extend(f"{dig.name} (AID {dig.package_id}): {w}" for w in report_warnings)
         except Exception as error:  # noqa: BLE001
             issues.append(f"{dig.name} (AID {dig.package_id}): staking report failed - {error}")
+
+        if excavation_template:
+            tick((index - 0.1) / total, f"{dig.name} (AID {dig.package_id}) - excavation report")
+            try:
+                pdf, pdf_warnings = build_excavation_report(excavation_template, dig, lazy=True)
+                outputs[excavation_report_name(dig)] = pdf
+                issues.extend(f"{dig.name} (AID {dig.package_id}): {w}" for w in pdf_warnings)
+            except Exception as error:  # noqa: BLE001
+                issues.append(f"{dig.name} (AID {dig.package_id}): excavation report failed - {error}")
+
+        if profile_template:
+            tick((index - 0.05) / total, f"{dig.name} (AID {dig.package_id}) - profile")
+            try:
+                sheet, sheet_warnings = build_profile_report(profile_template, dig)
+                outputs[profile_report_name(dig)] = sheet
+                # The same title line feeds the excavation report, which already warned.
+                if not excavation_template:
+                    issues.extend(f"{dig.name} (AID {dig.package_id}): {w}" for w in sheet_warnings)
+            except Exception as error:  # noqa: BLE001
+                issues.append(f"{dig.name} (AID {dig.package_id}): profile failed - {error}")
 
     # One cheat sheet per package: the packages are separate assessments, so
     # their odometers are not on one scale.
@@ -2403,7 +2800,7 @@ def generate_files(
             issues.append(f"AID {package_id}: no cheat sheet template uploaded.")
             continue
         try:
-            outputs[f"AID {package_id} - Dig Stake Cheat Sheet.xlsx"] = build_cheat_sheet(
+            outputs[cheat_sheet_name(package_id)] = build_cheat_sheet(
                 template, group, auto_notes=options.auto_notes,
             )
         except Exception as error:  # noqa: BLE001
@@ -2439,8 +2836,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     st.title("Enterprise Dig File Generator")
     st.caption(
-        "Fills a staking report for every dig sheet in your dig packages, plus a "
-        "cheat sheet for each package. On the staking reports, latitude, longitude, "
+        "Fills a staking report, an excavation survey report and a profile for "
+        "every dig sheet in your dig packages, plus a cheat sheet for each package, "
+        "in one folder per AID. On the staking reports, latitude, longitude, "
         "elevation, EDOC, survey date and photos are field measurements and are left blank."
     )
 
@@ -2466,6 +2864,34 @@ def main() -> None:
             key="kmz",
         )
 
+    left2, right2 = st.columns(2)
+    with left2:
+        excavation_file = st.file_uploader(
+            "Excavation Survey Report template (.pdf) - optional", type=["pdf"],
+            key="excavation",
+            help="Enterprise's fillable Excavation Survey Report. One is filled "
+                 "for every dig and stays editable in Adobe.",
+        )
+    with right2:
+        profile_file = st.file_uploader(
+            "Profile template (.xlsx) - optional", type=["xlsx"], key="profile",
+            help="Enterprise's dig profile workbook. One is filled for every dig.",
+        )
+    if excavation_file is not None:
+        try:
+            from pypdf import PdfReader
+            _xfa_datasets(PdfReader(io.BytesIO(excavation_file.getvalue())))
+        except Exception as error:  # noqa: BLE001
+            st.warning(f"Excavation Survey Report template: {error}")
+    if profile_file is not None:
+        try:
+            names = XlsmPatcher(profile_file.getvalue()).sheet_names()
+            if PROFILE_SHEET not in names:
+                st.warning(f"Profile template: no '{PROFILE_SHEET}' sheet - found "
+                           f"{', '.join(names)}.")
+        except Exception as error:  # noqa: BLE001
+            st.warning(f"Profile template: not a readable workbook ({error}).")
+
     template_info: Optional[TemplateInfo] = None
     if template_file is not None:
         template_info = read_template_info(template_file.getvalue())
@@ -2488,13 +2914,6 @@ def main() -> None:
             "Surveyed by", value="",
             help="The phone number fills itself in from the template's Contacts table.",
         )
-
-    template_notes = template_info.staking_notes if template_info else ""
-    staking_notes = st.sidebar.text_area(
-        "Staking notes", value=template_notes, height=140,
-        help="Starts as the template's own text. Left alone, the template's "
-             "notes are not touched.",
-    )
 
     st.sidebar.header("Aerial image")
     make_aerial = st.sidebar.checkbox("Generate aerial images", value=True)
@@ -2647,11 +3066,8 @@ def main() -> None:
             flavour = cheat_sheet_flavour(upload.getvalue())
             cheat_templates.setdefault(flavour, upload.getvalue())
 
-        settings = ReportSettings(
-            surveyor_name=surveyor_name,
-            staking_notes=None if staking_notes.strip() == template_notes.strip()
-            else staking_notes,
-        )
+        # The Staking Notes box is left exactly as the template has it.
+        settings = ReportSettings(surveyor_name=surveyor_name)
         options = RunOptions(
             make_aerial=make_aerial, basemap=basemap, span_feet=float(span_feet),
             make_directions=make_directions, token=token,
@@ -2668,14 +3084,32 @@ def main() -> None:
             options,
             phones=template_info.phones if template_info else {},
             progress=lambda fraction, text: bar.progress(fraction, text=text),
+            excavation_template=excavation_file.getvalue() if excavation_file else None,
+            profile_template=profile_file.getvalue() if profile_file else None,
         )
         bar.empty()
         st.session_state.outputs = outputs
+        st.session_state.zip_path = None
         st.session_state.generated = [d.key for d in selected]
         for issue in issues:
             st.warning(issue)
 
     _downloads(st)
+
+
+def write_zip(files: dict, handle) -> None:
+    """Write {path: bytes | AppendedPdf} into a zip, one entry at a time."""
+    with zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in sorted(files):
+            data = files[name]
+            if isinstance(data, AppendedPdf):
+                # PDFs barely compress, and a hundred of them take minutes to deflate.
+                entry = zipfile.ZipInfo(name, date_time=_dt.datetime.now().timetuple()[:6])
+                entry.compress_type = zipfile.ZIP_STORED
+                with archive.open(entry, "w", force_zip64=True) as target:
+                    data.write_to(target)
+            else:
+                archive.writestr(name, data)
 
 
 def _downloads(st) -> None:
@@ -2684,22 +3118,29 @@ def _downloads(st) -> None:
         return
     st.subheader("Files")
 
-    bundle = io.BytesIO()
-    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name, data in outputs.items():
-            archive.writestr(name, data)
+    # Built once per run, on disk: with the excavation PDFs this is hundreds of MB.
+    path = st.session_state.get("zip_path")
+    if not path or not os.path.exists(path):
+        handle = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        with handle:
+            write_zip(outputs, handle)
+        path = st.session_state.zip_path = handle.name
+    megabytes = os.path.getsize(path) / 1_000_000
 
-    st.download_button(
-        "Download everything (.zip)",
-        data=bundle.getvalue(),
-        file_name=f"Enterprise Dig Files {date.today():%Y-%m-%d}.zip",
-        mime="application/zip",
-        type="primary",
-    )
+    with open(path, "rb") as zipped:
+        st.download_button(
+            f"Download everything (.zip, {megabytes:,.0f} MB)",
+            data=zipped,
+            file_name=f"Enterprise Dig Files {date.today():%Y-%m-%d}.zip",
+            mime="application/zip",
+            type="primary",
+        )
+    st.caption("One folder per AID. Staking reports and the cheat sheet are in the "
+               "folder; excavation and profile reports are in subfolders.")
 
-    for name, data in outputs.items():
-        mime = XLSM_MIME if name.endswith(".xlsm") else XLSX_MIME
-        st.download_button(name, data=data, file_name=name, mime=mime, key=f"dl_{name}")
+    with st.expander(f"{len(outputs)} files in the zip", expanded=False):
+        for name in sorted(outputs):
+            st.text(name)
 
     keys = set(st.session_state.get("generated") or [])
     previews = [d for d in (st.session_state.digs or [])
