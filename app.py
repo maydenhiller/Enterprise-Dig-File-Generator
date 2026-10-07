@@ -2683,7 +2683,7 @@ def folder_for(dig: Dig) -> str:
 
 
 def staking_report_name(dig: Dig) -> str:
-    return f"{folder_for(dig)}/02-03 Survey Staking Report_Dig#{_file_part(dig.number)}.xlsm"
+    return f"{folder_for(dig)}/Staking Reports/02-03 Survey Staking Report_Dig#{_file_part(dig.number)}.xlsm"
 
 
 def excavation_report_name(dig: Dig) -> str:
@@ -3135,8 +3135,8 @@ def _downloads(st) -> None:
             mime="application/zip",
             type="primary",
         )
-    st.caption("One folder per AID. Staking reports and the cheat sheet are in the "
-               "folder; excavation and profile reports are in subfolders.")
+    st.caption("One folder per AID. The cheat sheet is in the folder; staking, "
+               "excavation and profile reports are in their own subfolders.")
 
     with st.expander(f"{len(outputs)} files in the zip", expanded=False):
         for name in sorted(outputs):
