@@ -79,7 +79,7 @@ def test_title_line_parsing():
 
 def test_output_names(digs):
     d = next(x for x in digs[0] if x.number == "02B")
-    assert app.staking_report_name(d) == "AID 115/02-03 Survey Staking Report_Dig#02B.xlsm"
+    assert app.staking_report_name(d) == "AID 115/Staking Reports/02-03 Survey Staking Report_Dig#02B.xlsm"
     assert app.excavation_report_name(d) == (
         "AID 115/Excavation Survey Reports/ExcavationSurvey Report_Dig 02B.pdf")
     assert app.profile_report_name(d) == "AID 115/Profile Reports/Profile Dig #02B.xlsx"
