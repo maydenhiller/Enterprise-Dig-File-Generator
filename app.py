@@ -2648,9 +2648,9 @@ def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
                          f"found {', '.join(names)}.")
 
     cells = {
-        "F3": info.line_name,
-        "F4": info.segment_name,
-        "F5": (f"Line ID {info.line_id} /ASMT ID {info.assessment_id}"
+        "E3": info.line_name,
+        "E4": info.segment_name,
+        "E5": (f"Line ID {info.line_id} /ASMT ID {info.assessment_id}"
                if info.line_id and info.assessment_id else None),
         "C9": info.dig_number or None,
     }
