@@ -7,9 +7,11 @@ import app
 EX = os.environ.get("EXAMPLES", "/root/.claude/uploads/12d12e69-6887-5c44-990e-a999b131df49")
 
 def find(part):
-    for n in os.listdir(EX):
-        if part in n:
-            return open(os.path.join(EX, n), "rb").read()
+    # newest match wins, so a re-uploaded template replaces an older one
+    hits = sorted((n for n in os.listdir(EX) if part in n),
+                  key=lambda n: os.path.getmtime(os.path.join(EX, n)), reverse=True)
+    if hits:
+        return open(os.path.join(EX, hits[0]), "rb").read()
     pytest.skip(f"{part} not available")
 
 @pytest.fixture(scope="module")
@@ -115,9 +117,9 @@ def test_profile_report(digs):
     wb = openpyxl.load_workbook(io.BytesIO(out))
     assert wb.sheetnames == ["Profile"]
     ws = wb.active
-    assert ws["F3"].value == "East Leg Mainline" and ws["F4"].value == '8.625" MP 52 to Kearney'
-    assert ws["F5"].value == "Line ID 600-601-602 /ASMT ID 115" and ws["C9"].value == "03A"
-    assert ws["L7"].value is None and ws["F2"].value == "Enterprise Products"
+    assert ws["E3"].value == "East Leg Mainline" and ws["E4"].value == '8.625" MP 52 to Kearney'
+    assert ws["E5"].value == "Line ID 600-601-602 /ASMT ID 115" and ws["C9"].value == "03A"
+    assert ws["M7"].value is None and ws["E2"].value == "Enterprise Products"
 
 
 def test_zip_layout_and_lazy_pdf(digs):
