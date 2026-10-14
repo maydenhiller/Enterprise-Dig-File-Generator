@@ -989,6 +989,7 @@ class PipelineData:
 
     lines: list = field(default_factory=list)       # list[list[tuple[float, float]]]
     line_names: list = field(default_factory=list)  # parallel to lines
+    line_colours: list = field(default_factory=list)  # parallel to lines: (r, g, b) or None
     digs: list = field(default_factory=list)        # list[DigPlacemark]
     source_name: str = ""
 
@@ -1032,9 +1033,60 @@ def _plain_text(markup: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _kml_colour(text: str):
+    """KML writes colour as aabbggrr hex. Returns (r, g, b), or None."""
+    text = (text or "").strip().lstrip("#")
+    if len(text) != 8:
+        return None
+    try:
+        blue, green, red = int(text[2:4], 16), int(text[4:6], 16), int(text[6:8], 16)
+    except ValueError:
+        return None
+    return (red, green, blue)
+
+
+def _line_style_colours(root) -> dict:
+    """Map '#styleId' -> the LineStyle colour it draws, following StyleMaps.
+
+    A line placemark points at a StyleMap, whose 'normal' pair points at a Style.
+    Google Earth draws the normal pair, so that is the colour the user sees.
+    """
+    direct, maps = {}, {}
+    for element in root.iter():
+        tag = _strip_namespace(element.tag)
+        if tag == "Style" and element.get("id"):
+            for child in element.iter():
+                if _strip_namespace(child.tag) == "LineStyle":
+                    for item in child:
+                        if _strip_namespace(item.tag) == "color":
+                            colour = _kml_colour(item.text)
+                            if colour:
+                                direct["#" + element.get("id")] = colour
+        elif tag == "StyleMap" and element.get("id"):
+            normal = None
+            for pair in element:
+                key = url = ""
+                for item in pair:
+                    item_tag = _strip_namespace(item.tag)
+                    if item_tag == "key":
+                        key = (item.text or "").strip()
+                    elif item_tag == "styleUrl":
+                        url = (item.text or "").strip()
+                if key == "normal":
+                    normal = url
+            if normal:
+                maps["#" + element.get("id")] = normal
+    resolved = dict(direct)
+    for name, target in maps.items():
+        if target in direct:
+            resolved[name] = direct[target]
+    return resolved
+
+
 def parse_kml_bytes(data: bytes, source_name: str = "") -> PipelineData:
     result = PipelineData(source_name=source_name)
     root = ElementTree.fromstring(data)
+    style_colours = _line_style_colours(root)
 
     for placemark in root.iter():
         if _strip_namespace(placemark.tag) != "Placemark":
@@ -1045,11 +1097,21 @@ def parse_kml_bytes(data: bytes, source_name: str = "") -> PipelineData:
         extended = {}
         line_points = []
         point = None
+        colour = None
 
         for element in placemark.iter():
             tag = _strip_namespace(element.tag)
             if tag == "name" and not name and element in list(placemark):
                 name = _plain_text(element.text)
+            elif tag == "styleUrl" and colour is None and element in list(placemark):
+                colour = style_colours.get((element.text or "").strip())
+            elif tag == "Style" and colour is None and element in list(placemark):
+                # A style written inline on the placemark itself.
+                for line_style in element:
+                    if _strip_namespace(line_style.tag) == "LineStyle":
+                        for item in line_style:
+                            if _strip_namespace(item.tag) == "color":
+                                colour = _kml_colour(item.text)
             elif tag == "SchemaData":
                 schema_url = element.get("schemaUrl", "")
                 for item in element:
@@ -1071,6 +1133,7 @@ def parse_kml_bytes(data: bytes, source_name: str = "") -> PipelineData:
         for points in line_points:
             result.lines.append(points)
             result.line_names.append(name)
+            result.line_colours.append(colour)
 
         # A dig placemark has a table of dig data; the Point inside the
         # pipeline's own MultiGeometry does not.
@@ -1103,6 +1166,7 @@ def parse_kmz(data: bytes, filename: str = "") -> PipelineData:
                 continue
             combined.lines.extend(part.lines)
             combined.line_names.extend(part.line_names)
+            combined.line_colours.extend(part.line_colours)
             combined.digs.extend(part.digs)
     return combined
 
@@ -1497,13 +1561,15 @@ NEIGHBOUR_WHITE = (245, 245, 245)
 
 
 def _legend(draw, entries, width, scale=1.0):
-    """``entries`` is a list of (label, swatch) where swatch is 'line', 'flag' or 'pin'."""
+    """``entries`` is a list of (label, swatch) or, for a line, (label, 'line', colour);
+    swatch is 'line', 'flag' or 'pin'."""
     if not entries:
         return
     font = _font(int(17 * scale))
     line_height = 22 * scale
     box_width = 188 * scale
-    for label, _ in entries:
+    for entry in entries:
+        label = entry[0]
         left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
         box_width = max(box_width, (right - left) + 52 * scale)
     box_height = 30 * scale + line_height * len(entries)
@@ -1517,13 +1583,15 @@ def _legend(draw, entries, width, scale=1.0):
         width=max(1, int(scale)),
     )
     draw.text((x0 + 9 * scale, y0 + 5 * scale), "Legend", font=font, fill=(20, 20, 20))
-    for index, (label, swatch) in enumerate(entries):
+    for index, entry in enumerate(entries):
+        label, swatch = entry[0], entry[1]
         y = y0 + 30 * scale + index * line_height
         centre_y = y + line_height * 0.42
         draw.text((x0 + 38 * scale, y), label, font=font, fill=(20, 20, 20))
         if swatch == "line":
             draw.line([(x0 + 9 * scale, centre_y), (x0 + 29 * scale, centre_y)],
-                      fill=PIPE_RED, width=max(2, int(4 * scale)))
+                      fill=entry[2] if len(entry) > 2 else PIPE_RED,
+                      width=max(2, int(4 * scale)))
         else:
             colour = PIN_YELLOW if swatch == "pin" else PIPE_RED
             radius = 5.5 * scale
@@ -1555,6 +1623,12 @@ def aerial_geometry(latitude: float, span_feet: float, width: int,
     zoom = max(0, min(int(math.ceil(exact - bonus - 1e-9)), max_zoom))
     factor = 2.0 ** (zoom + bonus - exact)           # canvas pixels per output pixel
     return zoom, factor, target_mpp
+
+
+def _line_colour(pipeline, index: int) -> tuple:
+    colours = getattr(pipeline, "line_colours", None) or []
+    colour = colours[index] if index < len(colours) else None
+    return tuple(colour) if colour else PIPE_RED
 
 
 def _line_runs(line, centre_lat, centre_lon, span_feet):
@@ -1659,16 +1733,25 @@ def render_aerial(
     legend_entries = []
 
     # --- pipeline centerline ---------------------------------------------
+    # Each line keeps the colour it has in the KMZ (the loop and the mainline are
+    # different colours there); a line with no colour of its own falls back to red.
     if pipeline is not None and pipeline.lines:
-        drew_line = False
-        for line in pipeline.lines:
+        drawn = []
+        for index, line in enumerate(pipeline.lines):
+            colour = _line_colour(pipeline, index)
+            drew_line = False
             for run in _line_runs(line, latitude, longitude, span_feet):
                 points = [project(lon, lat) for lon, lat in run]
-                draw.line(points, fill=PIPE_RED, width=max(4, int(4 * scale)),
+                draw.line(points, fill=colour, width=max(4, int(4 * scale)),
                           joint="curve")
                 drew_line = True
-        if drew_line:
-            legend_entries.append((pipeline.pipeline_label, "line"))
+            if drew_line:
+                label = (pipeline.line_names[index] if index < len(pipeline.line_names)
+                         and pipeline.line_names[index] else pipeline.pipeline_label)
+                if (label, colour) not in drawn:
+                    drawn.append((label, colour))
+        for label, colour in drawn:
+            legend_entries.append((label, "line", colour))
 
     # --- other digs from the same package, when they fall in the picture ---
     dig_x, dig_y = project(longitude, latitude)
