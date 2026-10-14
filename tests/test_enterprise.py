@@ -138,3 +138,26 @@ def test_zip_layout_and_lazy_pdf(digs):
         assert sorted(archive.namelist()) == sorted(files)
         pdf = archive.read(app.excavation_report_name(d))
         assert pdf.startswith(tpl) and len(pdf) == len(eager)
+
+
+def test_line_colours_come_from_kmz():
+    from PIL import Image
+    from types import SimpleNamespace as NS
+    k = app.parse_kmz(find("6710_77_79_6711"), "x.kmz")
+    assert len(k.lines) == 2
+    assert k.line_colours == [(255, 0, 0), (255, 255, 0)]      # loop red, mainline yellow
+
+    real = app._basemap_image
+    app._basemap_image = lambda view, url, token: (Image.new("RGB", (view.width, view.height), (60, 70, 50)), 1)
+    try:
+        dig = NS(latitude=38.76151, longitude=-97.51396, name="Dig # 05A",
+                 upstream_reference=None, downstream_reference=None,
+                 us_ref_lat=None, us_ref_lon=None, ds_ref_lat=None, ds_ref_lon=None,
+                 package_id="6710", feature_id="77001033")
+        jpeg = app.render_aerial(dig, k, width=800, slot_aspect=1600 / 835)
+    finally:
+        app._basemap_image = real
+    img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    pixels = list(img.getdata())
+    assert any(r > 200 and g < 60 and b < 60 for r, g, b in pixels)      # red line drawn
+    assert any(r > 200 and g > 200 and b < 90 for r, g, b in pixels)     # yellow line drawn
