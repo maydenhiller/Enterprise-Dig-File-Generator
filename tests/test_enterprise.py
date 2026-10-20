@@ -250,3 +250,36 @@ def test_dig_line_is_highlighted_and_named():
         assert app.render_aerial(d, pipeline, width=800)
     finally:
         app._basemap_image = real
+
+
+def test_as_built_drawing():
+    import re
+    digs = app.parse_dig_package(find("LID_26733"), "x_AID_257.xlsm")
+    d = next(x for x in digs if x.number == "06B")
+    assert 268 < d.flow_bearing < 269          # flow runs west-southwest
+    out, warn = app.build_as_built(find("As_Built_Template"), d)
+    assert not warn
+    z = zipfile.ZipFile(io.BytesIO(out))
+    assert z.testzip() is None
+    xml = z.read("visio/pages/page1.xml").decode()
+    for text in ("U/S Weld # 438000", "2014+43", "D/S Weld # 439000", "2013+93",
+                 "Port Arthur to MTBV", "Lake Charles 4", "LID: 26733  AID: 257", "Dig # 06B",
+                 "Jefferson County, TX", "S MILES, A-172", "38.15", "PAL_007.pdf"):
+        assert text in xml, text
+    assert "XXXX" not in xml.split("Shape ID='193'")[1].split("</Shape>")[0]
+    # compass turned to the flow bearing; D.O.C., prepared by and date left alone
+    angle = float(re.search(r"<Shape ID='294'[^>]*><Cell N='Angle' V='([^']+)'", xml).group(1))
+    assert abs(angle - 4.6827) < 0.001
+    assert "?.??" in xml and "???????" in xml
+    # the title sits between the two logos whatever the length of the name
+    gap = app._logo_gap(xml)
+    title = xml[xml.index("<Shape ID='264'"):]
+    width = float(re.search(r"<Cell N='Width' V='([^']+)'", title).group(1))
+    centre = float(re.search(r"<Cell N='PinX' V='([^']+)'", title).group(1))
+    assert gap[0] < centre - width / 2 and centre + width / 2 < gap[1]
+    long_dig = type(d)(**{**d.__dict__, "header": "Line ID 1 / Asmt ID 2, " + "Very Long Pipeline Name " * 6 + ': Section 12"'})
+    out2, _ = app.build_as_built(find("As_Built_Template"), long_dig)
+    xml2 = zipfile.ZipFile(io.BytesIO(out2)).read("visio/pages/page1.xml").decode()
+    sizes = re.findall(r"<Row IX='0'><Cell N='Style' V='21'/><Cell N='Size' V='([\d.]+)'", xml2)
+    assert float(sizes[0]) < 24 / 72
+    assert app.as_built_name(d) == "AID 257/As-Builts/As-Built Dig #06B.vsdx"
