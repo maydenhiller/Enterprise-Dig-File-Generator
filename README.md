@@ -43,7 +43,7 @@ editable; accuracy stays Sub-Meter. All of it comes from the dig sheet's title l
 **Profile** is the template's Blank sheet with Line Name, Segment Name, `Line ID x /ASMT ID y`
 and Dig # filled in from the same title line, plus the U/S and D/S weld IDs (U6, U8) and
 stationing (U7, U9) read from the package's `Site Ref` tabs; the rest is as the template has it.
-A weld not listed on the Site Ref tabs is left blank with a warning.
+A weld not listed on the Site Ref tabs is worked out from the other weld: its stationing is the known weld's plus or minus the joint length, and a warning says so.
 
 **As-Built** (optional .vsdx template) is the template's page with: pipeline / section / LID / AID / dig # in the
 title block (narrowed to sit between the two logos, font shrunk per line so it never covers one); the U/S and D/S weld
