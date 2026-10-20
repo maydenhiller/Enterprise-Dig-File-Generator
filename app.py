@@ -1502,6 +1502,7 @@ USER_AGENT = "Enterprise-Dig-File-Generator/1.0 (staking report automation)"
 DEFAULT_TILE_SIZE = 256
 
 PIPE_RED = (226, 32, 32)
+KML_DEFAULT_LINE = (255, 255, 255)
 LABEL_WHITE = (255, 255, 255)
 SHADOW = (0, 0, 0)
 
@@ -1915,7 +1916,8 @@ def _label_line(draw, runs, text, dig_x, dig_y, width, height, scale):
 def _line_colour(pipeline, index: int) -> tuple:
     colours = getattr(pipeline, "line_colours", None) or []
     colour = colours[index] if index < len(colours) else None
-    return tuple(colour) if colour else PIPE_RED
+    # A LineStyle with no <color> is white in KML (and in Google Earth).
+    return tuple(colour) if colour else KML_DEFAULT_LINE
 
 
 def _norm_name(text: str) -> str:
