@@ -242,8 +242,8 @@ def test_dig_line_is_highlighted_and_named():
     d = next(x for x in digs if x.number == "06B")
     assert pipeline.line_ids[0] == "26733"
     assert app.dig_line_index(pipeline, d) == 0
-    colours = app.assign_line_colours(pipeline)
-    assert len(set(colours)) == len(colours)
+    colours = app.assign_line_colours(pipeline, 0)
+    assert colours[0] == app.PIPE_RED and len(set(colours)) == len(colours)
     real = app._basemap_image
     app._basemap_image = lambda v, u, t: (Image.new("RGB", (v.width, v.height), (60, 80, 50)), 1)
     try:
