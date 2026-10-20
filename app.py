@@ -295,6 +295,152 @@ class XlsmPatcher:
         self.parts[path] = xml.encode("utf-8")
         return missing
 
+    def restyle(self, sheet_name: str, refs, size: Optional[float] = None,
+                shrink: bool = False) -> None:
+        """Give cells a copy of their own style with a smaller font and/or
+        shrink-to-fit. The original style is left alone, so other cells that
+        share it are unaffected."""
+        path = self._sheet_paths.get(sheet_name)
+        if path is None:
+            return
+        xml = self._text(path)
+        styles = self._text("xl/styles.xml")
+
+        fonts_match = re.search(r"(<fonts\b[^>]*>)(.*?)(</fonts>)", styles, re.S)
+        xfs_match = re.search(r"(<cellXfs\b[^>]*>)(.*?)(</cellXfs>)", styles, re.S)
+        if not fonts_match or not xfs_match:
+            return
+        font_pattern = r"<font\b[^>]*?/>|<font\b[^>]*?>.*?</font>"
+        xf_pattern = r"<xf\b[^>]*?/>|<xf\b[^>]*?>.*?</xf>"
+        fonts = re.findall(font_pattern, fonts_match.group(2), re.S)
+        xfs = re.findall(xf_pattern, xfs_match.group(2), re.S)
+
+        made = {}
+
+        def variant(index: int) -> int:
+            if index in made:
+                return made[index]
+            xf = xfs[index]
+            if size is not None:
+                font_match = re.search(r'fontId="(\d+)"', xf)
+                font_id = int(font_match.group(1)) if font_match else 0
+                font = fonts[font_id]
+                if "<sz " in font:
+                    font = re.sub(r'<sz val="[^"]*"\s*/>', f'<sz val="{size:g}"/>', font, 1)
+                else:
+                    font = font.replace("<font>", f'<font><sz val="{size:g}"/>', 1)
+                fonts.append(font)
+                new_font = len(fonts) - 1
+                xf = (re.sub(r'fontId="\d+"', f'fontId="{new_font}"', xf, 1)
+                      if font_match else xf.replace("<xf ", f'<xf fontId="{new_font}" ', 1))
+                if "applyFont=" in xf:
+                    xf = re.sub(r'applyFont="\d"', 'applyFont="1"', xf, 1)
+                else:
+                    xf = xf.replace("<xf ", '<xf applyFont="1" ', 1)
+            if shrink:
+                if xf.endswith("/>") and "</xf>" not in xf:
+                    xf = xf[:-2] + "></xf>"
+                if "<alignment" in xf:
+                    xf = re.sub(r'\swrapText="\d"', "", xf, 1)
+                    if "shrinkToFit=" not in xf:
+                        xf = xf.replace("<alignment", '<alignment shrinkToFit="1"', 1)
+                else:
+                    xf = re.sub(r"(<xf\b[^>]*?>)", r'\1<alignment shrinkToFit="1"/>', xf, 1)
+                if "applyAlignment=" in xf:
+                    xf = re.sub(r'applyAlignment="\d"', 'applyAlignment="1"', xf, 1)
+                else:
+                    xf = xf.replace("<xf ", '<xf applyAlignment="1" ', 1)
+            xfs.append(xf)
+            made[index] = len(xfs) - 1
+            return made[index]
+
+        for ref in refs:
+            match = re.search(rf'<c r="{ref}"([^>]*?)(/?)>', xml)
+            if not match:
+                continue
+            style = re.search(r'\ss="(\d+)"', match.group(1))
+            index = int(style.group(1)) if style else 0
+            if index >= len(xfs):
+                continue
+            attrs = match.group(1)
+            new_index = variant(index)
+            attrs = (re.sub(r'\ss="\d+"', f' s="{new_index}"', attrs, 1)
+                     if style else attrs + f' s="{new_index}"')
+            xml = xml[:match.start()] + f'<c r="{ref}"{attrs}{match.group(2)}>' + xml[match.end():]
+
+        if not made:
+            return
+        fonts_head = re.sub(r'count="\d+"', f'count="{len(fonts)}"', fonts_match.group(1), 1)
+        xfs_head = re.sub(r'count="\d+"', f'count="{len(xfs)}"', xfs_match.group(1), 1)
+        # Replace the later section first so the earlier match offsets stay valid.
+        first, second = sorted(
+            [(fonts_match, fonts_head, "".join(fonts)), (xfs_match, xfs_head, "".join(xfs))],
+            key=lambda item: item[0].start(), reverse=True)
+        for match, head, body in (first, second):
+            styles = styles[:match.start()] + head + body + match.group(3) + styles[match.end():]
+        self.parts["xl/styles.xml"] = styles.encode("utf-8")
+        self.parts[path] = xml.encode("utf-8")
+
+    def cell_text(self, sheet_name: str, ref: str) -> str:
+        """The text a cell shows: an inline or shared string, or a formula's last result."""
+        path = self._sheet_paths.get(sheet_name)
+        if path is None:
+            return ""
+        match = _cell_pattern(ref).search(self._text(path))
+        if not match or not match.group("body"):
+            return ""
+        attrs, body = match.group("attrs"), match.group("body")
+        kind = re.search(r'\st="(\w+)"', attrs)
+        kind = kind.group(1) if kind else ""
+        if kind == "inlineStr":
+            return _unescape("".join(re.findall(r"<t[^>]*>(.*?)</t>", body, re.S)))
+        value = re.search(r"<v>(.*?)</v>", body, re.S)
+        if value is None:
+            return ""
+        if kind == "s" and "xl/sharedStrings.xml" in self.parts:
+            items = re.findall(r"<si>(.*?)</si>", self._text("xl/sharedStrings.xml"), re.S)
+            index = int(value.group(1))
+            if index < len(items):
+                return _unescape("".join(re.findall(r"<t[^>]*>(.*?)</t>", items[index], re.S)))
+            return ""
+        return _unescape(value.group(1))
+
+    def box_size(self, sheet_name: str, ref: str) -> Optional[tuple]:
+        """(width in pixels, height in points) of the merged box a cell starts."""
+        path = self._sheet_paths.get(sheet_name)
+        if path is None:
+            return None
+        xml = self._text(path)
+        merge = re.search(rf'<mergeCell ref="{ref}:([A-Z]+)(\d+)"', xml)
+        start_row = int(re.search(r"\d+", ref).group(0))
+        first_col = _column_index(re.match(r"[A-Z]+", ref).group(0))
+        if merge:
+            last_col, last_row = _column_index(merge.group(1)), int(merge.group(2))
+        else:
+            last_col, last_row = first_col, start_row
+
+        default_width = re.search(r'<sheetFormatPr[^>]*defaultColWidth="([\d.]+)"', xml)
+        default_width = float(default_width.group(1)) if default_width else 8.43
+        default_height = re.search(r'<sheetFormatPr[^>]*defaultRowHeight="([\d.]+)"', xml)
+        default_height = float(default_height.group(1)) if default_height else 15.0
+        widths = {}
+        for col in re.finditer(r"<col\b[^>]*/>", xml):
+            tag = col.group(0)
+            low, high = re.search(r'min="(\d+)"', tag), re.search(r'max="(\d+)"', tag)
+            width = re.search(r'width="([\d.]+)"', tag)
+            if low and high and width:
+                for index in range(int(low.group(1)), min(int(high.group(1)), 200) + 1):
+                    widths[index] = float(width.group(1))
+        heights = {}
+        for row in re.finditer(r"<row\b[^>]*>", xml):
+            tag = row.group(0)
+            number, height = re.search(r' r="(\d+)"', tag), re.search(r' ht="([\d.]+)"', tag)
+            if number and height:
+                heights[int(number.group(1))] = float(height.group(1))
+        width_px = sum(widths.get(i, default_width) * 7 for i in range(first_col, last_col + 1))
+        height_pt = sum(heights.get(r, default_height) for r in range(start_row, last_row + 1))
+        return width_px, height_pt
+
     def set_cached(self, sheet_name: str, values: dict) -> None:
         """Refresh the value a formula cell last computed, leaving the formula.
 
@@ -1560,43 +1706,85 @@ PIN_YELLOW = (255, 214, 0)
 NEIGHBOUR_WHITE = (245, 245, 245)
 
 
-def _legend(draw, entries, width, scale=1.0):
-    """``entries`` is a list of (label, swatch) or, for a line, (label, 'line', colour);
-    swatch is 'line', 'flag' or 'pin'."""
+def _layer_count(layer, box) -> int:
+    """How many pixels of a transparent layer are drawn inside ``box``."""
+    if layer is None:
+        return 0
+    left, top, right, bottom = (int(round(v)) for v in box)
+    left, top = max(left, 0), max(top, 0)
+    right, bottom = min(right, layer.width), min(bottom, layer.height)
+    if right <= left or bottom <= top:
+        return 0
+    alpha = layer.crop((left, top, right, bottom)).getchannel("A")
+    return alpha.point(lambda value: 255 if value else 0).histogram()[255]
+
+
+def _legend(layer, entries, width, height, scale=1.0, avoid=None, soft=None):
+    """Draw the legend on its own layer, in the corner that hides the least.
+
+    ``entries`` is a list of (label, swatch) or, for a line, (label, 'line', colour);
+    swatch is 'line', 'flag' or 'pin'. ``avoid`` is the layer holding the dig pin,
+    flags and labels (covering those is what must not happen) and ``soft`` the one
+    holding the pipeline lines (covering a stretch of line is a lesser evil).
+    """
     if not entries:
         return
-    font = _font(int(17 * scale))
-    line_height = 22 * scale
-    box_width = 188 * scale
-    for entry in entries:
-        label = entry[0]
-        left, top, right, bottom = draw.textbbox((0, 0), label, font=font)
-        box_width = max(box_width, (right - left) + 52 * scale)
-    box_height = 30 * scale + line_height * len(entries)
-    x0 = width - box_width - 14 * scale
-    y0 = 12 * scale
+    draw = ImageDraw.Draw(layer, "RGBA")
+
+    # Start at a readable size and shrink until the box is a modest part of the
+    # picture - a long list of lines must not take over the aerial.
+    size = 11.5
+    while True:
+        unit = size * scale / 17.0
+        font = _font(max(8, int(17 * unit)))
+        line_height = 20 * unit
+        box_width = 120 * unit
+        for entry in entries:
+            left, top, right, bottom = draw.textbbox((0, 0), entry[0], font=font)
+            box_width = max(box_width, (right - left) + 52 * unit)
+        box_height = 30 * unit + line_height * len(entries)
+        if (box_width <= width * 0.36 and box_height <= height * 0.42) or size <= 7:
+            break
+        size -= 0.5
+
+    margin = 12 * scale
+    candidates = [
+        (width - box_width - margin, margin),                          # top right
+        (margin, height - box_height - margin),                        # bottom left
+        (margin, 62 * scale + margin),                                 # top left, under the title card
+        (width - box_width - margin, height - box_height - 100 * scale),  # bottom right, above the scale bar
+    ]
+    best, best_score = candidates[0], None
+    for order, (x, y) in enumerate(candidates):
+        x = min(max(x, 0), max(width - box_width, 0))
+        y = min(max(y, 0), max(height - box_height, 0))
+        box = (x, y, x + box_width, y + box_height)
+        score = _layer_count(avoid, box) * 10 + _layer_count(soft, box) + order
+        if best_score is None or score < best_score:
+            best, best_score = (x, y), score
+    x0, y0 = best
 
     draw.rectangle(
         [x0, y0, x0 + box_width, y0 + box_height],
-        fill=(255, 255, 255, 235),
+        fill=(255, 255, 255, 230),
         outline=(120, 120, 120),
         width=max(1, int(scale)),
     )
-    draw.text((x0 + 9 * scale, y0 + 5 * scale), "Legend", font=font, fill=(20, 20, 20))
+    draw.text((x0 + 9 * unit, y0 + 5 * unit), "Legend", font=font, fill=(20, 20, 20))
     for index, entry in enumerate(entries):
         label, swatch = entry[0], entry[1]
-        y = y0 + 30 * scale + index * line_height
+        y = y0 + 28 * unit + index * line_height
         centre_y = y + line_height * 0.42
-        draw.text((x0 + 38 * scale, y), label, font=font, fill=(20, 20, 20))
+        draw.text((x0 + 38 * unit, y), label, font=font, fill=(20, 20, 20))
         if swatch == "line":
-            draw.line([(x0 + 9 * scale, centre_y), (x0 + 29 * scale, centre_y)],
+            draw.line([(x0 + 9 * unit, centre_y), (x0 + 29 * unit, centre_y)],
                       fill=entry[2] if len(entry) > 2 else PIPE_RED,
-                      width=max(2, int(4 * scale)))
+                      width=max(2, int(4 * unit)))
         else:
             colour = PIN_YELLOW if swatch == "pin" else PIPE_RED
-            radius = 5.5 * scale
-            draw.ellipse([x0 + 19 * scale - radius, centre_y - radius,
-                          x0 + 19 * scale + radius, centre_y + radius],
+            radius = 5.5 * unit
+            draw.ellipse([x0 + 19 * unit - radius, centre_y - radius,
+                          x0 + 19 * unit + radius, centre_y + radius],
                          fill=colour, outline=(60, 60, 60))
 
 
@@ -1753,6 +1941,12 @@ def render_aerial(
         for label, colour in drawn:
             legend_entries.append((label, "line", colour))
 
+    # Everything else goes on its own layer so the legend can be placed where
+    # it covers the least (pin, flags and labels matter most, lines less).
+    lines_layer = overlay
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+
     # --- other digs from the same package, when they fall in the picture ---
     dig_x, dig_y = project(longitude, latitude)
     if show_neighbours and pipeline is not None:
@@ -1805,13 +1999,19 @@ def render_aerial(
     if dig.name:
         legend_entries.append((dig.name, "pin"))
 
-    if show_legend:
-        _legend(draw, legend_entries, width, scale)
     _title_card(draw, dig.name, scale)
     _scale_bar(draw, mpp, width, height, scale)
     _north_arrow(draw, width, height, scale)
 
-    image = Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB")
+    legend_layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    if show_legend:
+        _legend(legend_layer, legend_entries, width, height, scale,
+                avoid=overlay, soft=lines_layer)
+
+    image = image.convert("RGBA")
+    for layer in (lines_layer, overlay, legend_layer):
+        image = Image.alpha_composite(image, layer)
+    image = image.convert("RGB")
 
     # JPEG, not PNG: satellite imagery compresses far better as JPEG (roughly a
     # tenth of the size), which matters when a batch of 100+ reports is held in
@@ -2392,6 +2592,92 @@ class _NotSimple(Exception):
 _HIDDEN_HELPER_COLUMNS_FROM = 16  # column P onward is hidden on the Dig Sheet tab
 
 
+# ---------------------------------------------------------------------------
+# Keeping text inside its box
+# ---------------------------------------------------------------------------
+# A dig's directions, or an alignment sheet name, can be longer than the box the
+# template gives it, and Excel simply cuts the text off at the edge. One-line
+# cells are set to shrink to fit; the wrapped Directions / Staking Notes boxes
+# get the largest font that fits, worked out here with Calibri's own metrics
+# (Carlito, which is metric-compatible, when it is installed).
+
+SHRINK_TO_FIT_CELLS = ("G4", "I3", "A6", "I6", "C11", "C19", "C20", "C21", "C22", "C23", "C24")
+WRAPPED_BOXES = (CELL_DIRECTIONS, CELL_STAKING_NOTES)
+_CALIBRI_FILES = (
+    "/usr/share/fonts/truetype/crosextra/Carlito-Regular.ttf",
+    "/usr/share/fonts/truetype/crosextra/Carlito.ttf",
+    "/usr/share/fonts/carlito/Carlito-Regular.ttf",
+    "/usr/share/fonts/TTF/Carlito-Regular.ttf",
+)
+_CALIBRI = {"font": None, "tried": False}
+
+
+def _text_width(text: str, size_pt: float) -> float:
+    """Width in pixels (96 dpi) of ``text`` in Calibri at ``size_pt``."""
+    pixels = size_pt * 96 / 72
+    if not _CALIBRI["tried"]:
+        _CALIBRI["tried"] = True
+        for path in _CALIBRI_FILES:
+            try:
+                _CALIBRI["font"] = ImageFont.truetype(path, 100)
+                break
+            except OSError:
+                continue
+    font = _CALIBRI["font"]
+    if font is not None:
+        return font.getlength(text) * pixels / 100.0
+    # No Carlito: Calibri averages about half an em a character; a little more
+    # than that errs towards a smaller font rather than clipped text.
+    return len(text) * pixels * 0.54
+
+
+def wrapped_line_count(text: str, size_pt: float, width_px: float) -> int:
+    lines = 0
+    for paragraph in (text or "").split("\n"):
+        current = ""
+        count = 1
+        for word in paragraph.split(" "):
+            trial = f"{current} {word}" if current else word
+            if _text_width(trial, size_pt) <= width_px:
+                current = trial
+                continue
+            if current:
+                count += 1
+            # A single word wider than the box breaks across lines.
+            overflow = _text_width(word, size_pt)
+            while overflow > width_px:
+                count += 1
+                overflow -= width_px
+            current = word if overflow <= width_px else ""
+        lines += count
+    return lines
+
+
+def fit_font_size(text: str, width_px: float, height_pt: float,
+                  base: float = 11.0, minimum: float = 6.0) -> float:
+    """The largest font size, at most ``base``, at which wrapped text fits the box."""
+    usable_width = max(width_px - 10, 20) / 1.04          # padding + a safety margin
+    size = base
+    while size > minimum:
+        needed = wrapped_line_count(text, size, usable_width) * size * 1.37 + 4
+        if needed <= height_pt:
+            return size
+        size -= 0.5
+    return minimum
+
+
+def fit_report_text(patcher: XlsmPatcher, sheet: str = SHEET) -> None:
+    patcher.restyle(sheet, SHRINK_TO_FIT_CELLS, shrink=True)
+    for ref in WRAPPED_BOXES:
+        text = patcher.cell_text(sheet, ref)
+        box = patcher.box_size(sheet, ref)
+        if not text or box is None:
+            continue
+        size = fit_font_size(text, box[0], box[1])
+        if size < 11.0:
+            patcher.restyle(sheet, [ref], size=size)
+
+
 def build_staking_report(
     template_bytes: bytes,
     dig: Dig,
@@ -2444,6 +2730,7 @@ def build_staking_report(
         patcher, dig, written, phones or {}
     ).items():
         patcher.set_cached(sheet_name, cached)
+    fit_report_text(patcher)
     patcher.force_full_recalc()
 
     if dig.aerial_image:
