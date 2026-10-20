@@ -1847,9 +1847,6 @@ def _legend(layer, entries, width, height, scale=1.0, avoid=None, soft=None):
         centre_y = y + line_height * 0.42
         draw.text((x0 + 38 * unit, y), label, font=font, fill=(20, 20, 20))
         if swatch == "line":
-            if len(entry) > 3 and entry[3]:
-                draw.line([(x0 + 9 * unit, centre_y), (x0 + 29 * unit, centre_y)],
-                          fill=(255, 255, 255), width=max(3, int(8 * unit)))
             draw.line([(x0 + 9 * unit, centre_y), (x0 + 29 * unit, centre_y)],
                       fill=entry[2] if len(entry) > 2 else PIPE_RED,
                       width=max(2, int(4 * unit)))
@@ -2111,8 +2108,8 @@ def render_aerial(
             return (pipeline.line_names[index] if index < len(pipeline.line_names)
                     and pipeline.line_names[index] else pipeline.pipeline_label)
 
-        # Other lines first and thinner; the dig's own line last, thick, with a
-        # white halo so it reads as the pipeline the report is about.
+        # Other lines first and thinner; the dig's own line last, thick (no outline)
+        # so it reads as the pipeline the report is about.
         thin = max(3, int(3 * scale))
         for index, projected in runs_by_line.items():
             if index == dig_line:
@@ -2120,10 +2117,7 @@ def render_aerial(
             for points in projected:
                 draw.line(points, fill=colours[index] + (215,), width=thin, joint="curve")
         if dig_line in runs_by_line:
-            heavy = max(6, int(7 * scale))
-            for points in runs_by_line[dig_line]:
-                draw.line(points, fill=(255, 255, 255, 255), width=heavy + max(4, int(5 * scale)),
-                          joint="curve")
+            heavy = max(6, int(8 * scale))
             for points in runs_by_line[dig_line]:
                 draw.line(points, fill=colours[dig_line], width=heavy, joint="curve")
             dig_label_spot = runs_by_line[dig_line]
