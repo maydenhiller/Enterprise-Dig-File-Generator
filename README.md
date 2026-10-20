@@ -17,6 +17,8 @@ folder per AID.
   (dig numbers repeat across packages) and cross-checked against the dig sheet coordinates.
 - Aerial: rendered to the template slot's aspect; image width on the ground is exact.
   U/S and D/S reference flags come from the dig sheet's reference coordinates.
+  The dig's own pipeline (matched on Line ID = KMZ PipelineNumber, then name, then nearest) is drawn thick with a white halo,
+  named on the picture and marked "(this dig)" in the legend; other lines are thinner.
 - Cheat sheet Latitude/Longitude are filled from the dig sheet (anomaly row). On the staking report, Lat/Long, Elevation, EDOC, Survey Date and photos are never written. Phone (C12) stays an XLOOKUP.
 - All digs in the uploaded packages are generated in one run.
 
@@ -38,7 +40,9 @@ editable; accuracy stays Sub-Meter. All of it comes from the dig sheet's title l
 `Line ID 600-601-602 / Asmt ID 116,  East Leg Mainline, 8.625" Kearney to Moberly`.
 
 **Profile** is the template's Blank sheet with Line Name, Segment Name, `Line ID x /ASMT ID y`
-and Dig # filled in from the same title line; the rest is as the template has it.
+and Dig # filled in from the same title line, plus the U/S and D/S weld IDs (U6, U8) and
+stationing (U7, U9) read from the package's `Site Ref` tabs; the rest is as the template has it.
+A weld not listed on the Site Ref tabs is left blank with a warning.
 
 Each excavation PDF is the size of the template (about 4 MB), so a run over 100+ digs makes a
 zip of several hundred MB. Use a machine with the memory for it, or upload fewer packages per run.
