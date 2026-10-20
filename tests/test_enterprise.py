@@ -243,6 +243,7 @@ def test_dig_line_is_highlighted_and_named():
     assert pipeline.line_ids[0] == "26733"
     assert app.dig_line_index(pipeline, d) == 0
     assert app._line_colour(pipeline, 0) == (255, 0, 0)
+    assert app._line_colour(pipeline, 5) == (255, 255, 255)   # no colour in the KMZ = white
     real = app._basemap_image
     app._basemap_image = lambda v, u, t: (Image.new("RGB", (v.width, v.height), (60, 80, 50)), 1)
     try:
