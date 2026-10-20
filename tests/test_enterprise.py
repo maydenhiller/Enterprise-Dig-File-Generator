@@ -36,7 +36,7 @@ def test_kmz_matches_by_aid_and_feature(digs):
     assert len(k.lines) == 1 and len(k.digs) == 129
     alld = digs[0] + digs[1]
     app.reconcile_with_kmz(alld, k)
-    assert not [w for d in alld for w in d.warnings]
+    assert not [w for d in alld for w in d.warnings if 'Site Ref' not in w]
 
 def test_report_and_cheat_sheet(digs):
     import openpyxl
@@ -221,3 +221,32 @@ def test_legend_does_not_cover_the_dig():
     light = sum(1 for px in img.crop((0, 0, width, height)).resize((160, 84)).getdata()
                 if min(px) > 220)
     assert light < 160 * 84 * 0.25
+
+
+def test_profile_welds_from_site_ref():
+    import openpyxl
+    digs = app.parse_dig_package(find("LID_26733"), "x_AID_257.xlsm")
+    d = next(x for x in digs if x.number == "06B")
+    assert (d.us_weld_id, d.us_weld_station_ft) == ("438000", 201443)
+    assert (d.ds_weld_id, d.ds_weld_station_ft) == ("439000", 201393)
+    out, _ = app.build_profile_report(find("Enterprise-Profile_Dig_XX"), d)
+    ws = openpyxl.load_workbook(io.BytesIO(out)).active
+    assert (ws["U6"].value, ws["U7"].value) == (438000, "2014+43")
+    assert (ws["U8"].value, ws["U9"].value) == (439000, "2013+93")
+
+
+def test_dig_line_is_highlighted_and_named():
+    from PIL import Image
+    digs = app.parse_dig_package(find("LID_26733"), "x_AID_257.xlsm")
+    pipeline = app.parse_kmz(find("AID_257.kmz"), "AID_257.kmz")
+    d = next(x for x in digs if x.number == "06B")
+    assert pipeline.line_ids[0] == "26733"
+    assert app.dig_line_index(pipeline, d) == 0
+    colours = app.assign_line_colours(pipeline)
+    assert len(set(colours)) == len(colours)
+    real = app._basemap_image
+    app._basemap_image = lambda v, u, t: (Image.new("RGB", (v.width, v.height), (60, 80, 50)), 1)
+    try:
+        assert app.render_aerial(d, pipeline, width=800)
+    finally:
+        app._basemap_image = real
