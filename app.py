@@ -124,6 +124,10 @@ class Dig:
     ds_ref_lat: Optional[float] = None
     ds_ref_lon: Optional[float] = None
     us_weld_distance: Optional[float] = None      # G33
+    us_weld_id: str = ""                          # Site Ref: U/S GW ID_No.
+    us_weld_station_ft: Optional[int] = None
+    ds_weld_id: str = ""
+    ds_weld_station_ft: Optional[int] = None
     ds_weld_distance: Optional[float] = None      # I33
     joint_length: Optional[float] = None
     latitude: Optional[float] = None
@@ -1077,6 +1081,46 @@ def check_dig(dig: Dig) -> list:
     return problems
 
 
+SITE_REF_RE = re.compile(r"^Site Ref \(", re.I)
+WELD_MATCH_FEET = 1.5
+
+
+def read_site_ref_welds(workbook) -> list:
+    """Every WELD row on the Site Ref tabs as (odometer, gw_id, station)."""
+    welds = []
+    for name in workbook.sheetnames:
+        if not SITE_REF_RE.match(name) or "Template" in name:
+            continue
+        for row in workbook[name].iter_rows(min_row=2, max_col=24, values_only=True):
+            if len(row) < 24 or str(row[4] or "").strip().upper() != "WELD":
+                continue
+            odometer, station = _number(row[6]), _station(row[7])
+            gw = row[23]
+            if odometer is None or gw in (None, ""):
+                continue
+            welds.append((odometer, _text(gw), station))
+    return welds
+
+
+def assign_welds(dig: Dig, welds: list) -> None:
+    """Fill the dig's U/S and D/S weld IDs and stationing from the Site Ref welds."""
+    if dig.odometer is None:
+        return
+    for side, distance, sign in (("us", dig.us_weld_distance, -1),
+                                 ("ds", dig.ds_weld_distance, 1)):
+        if distance is None:
+            continue
+        target = dig.odometer + sign * distance
+        near = [w for w in welds if abs(w[0] - target) <= WELD_MATCH_FEET]
+        if not near:
+            dig.warnings.append(f"No {side.upper()} weld found on the Site Ref tabs "
+                                f"near odometer {target:.2f}.")
+            continue
+        odometer, gw, station = min(near, key=lambda w: abs(w[0] - target))
+        setattr(dig, f"{side}_weld_id", gw)
+        setattr(dig, f"{side}_weld_station_ft", station)
+
+
 def parse_dig_package(data: bytes, filename: str) -> list:
     """Every Dig sheet in a package, as Dig records in odometer order."""
     import openpyxl
@@ -1094,6 +1138,9 @@ def parse_dig_package(data: bytes, filename: str) -> list:
             if not cells.get("Q15") and not cells.get("G8"):
                 continue
             digs.append(dig_from_cells(cells, package_id, filename, sheet_name))
+        welds = read_site_ref_welds(workbook)
+        for dig in digs:
+            assign_welds(dig, welds)
     finally:
         workbook.close()
 
@@ -1136,6 +1183,7 @@ class PipelineData:
     lines: list = field(default_factory=list)       # list[list[tuple[float, float]]]
     line_names: list = field(default_factory=list)  # parallel to lines
     line_colours: list = field(default_factory=list)  # parallel to lines: (r, g, b) or None
+    line_ids: list = field(default_factory=list)      # parallel to lines: PipelineNumber text
     digs: list = field(default_factory=list)        # list[DigPlacemark]
     source_name: str = ""
 
@@ -1229,6 +1277,21 @@ def _line_style_colours(root) -> dict:
     return resolved
 
 
+def _description_field(description: str, field_name: str) -> str:
+    match = re.search(rf"{field_name}\s*</t[dh]>\s*<td[^>]*>(.*?)</td>", description or "",
+                      re.S | re.I)
+    return re.sub(r"<[^>]+>|\s+", " ", match.group(1)).strip() if match else ""
+
+
+def _pipeline_number(description: str, extended: dict) -> str:
+    return (extended.get("PipelineNumber") or
+            _description_field(description, "PipelineNumber")).strip()
+
+
+def _pipeline_name(description: str) -> str:
+    return _description_field(description, "PipelineName")
+
+
 def parse_kml_bytes(data: bytes, source_name: str = "") -> PipelineData:
     result = PipelineData(source_name=source_name)
     root = ElementTree.fromstring(data)
@@ -1241,6 +1304,7 @@ def parse_kml_bytes(data: bytes, source_name: str = "") -> PipelineData:
         name = ""
         schema_url = ""
         extended = {}
+        description = ""
         line_points = []
         point = None
         colour = None
@@ -1258,6 +1322,8 @@ def parse_kml_bytes(data: bytes, source_name: str = "") -> PipelineData:
                         for item in line_style:
                             if _strip_namespace(item.tag) == "color":
                                 colour = _kml_colour(item.text)
+            elif tag == "description" and not description and element in list(placemark):
+                description = element.text or ""
             elif tag == "SchemaData":
                 schema_url = element.get("schemaUrl", "")
                 for item in element:
@@ -1280,6 +1346,9 @@ def parse_kml_bytes(data: bytes, source_name: str = "") -> PipelineData:
             result.lines.append(points)
             result.line_names.append(name)
             result.line_colours.append(colour)
+            result.line_ids.append(_pipeline_number(description, extended))
+            if description and _pipeline_name(description) and not name.strip():
+                result.line_names[-1] = _pipeline_name(description)
 
         # A dig placemark has a table of dig data; the Point inside the
         # pipeline's own MultiGeometry does not.
@@ -1313,6 +1382,7 @@ def parse_kmz(data: bytes, filename: str = "") -> PipelineData:
             combined.lines.extend(part.lines)
             combined.line_names.extend(part.line_names)
             combined.line_colours.extend(part.line_colours)
+            combined.line_ids.extend(part.line_ids)
             combined.digs.extend(part.digs)
     return combined
 
@@ -1777,6 +1847,9 @@ def _legend(layer, entries, width, height, scale=1.0, avoid=None, soft=None):
         centre_y = y + line_height * 0.42
         draw.text((x0 + 38 * unit, y), label, font=font, fill=(20, 20, 20))
         if swatch == "line":
+            if len(entry) > 3 and entry[3]:
+                draw.line([(x0 + 9 * unit, centre_y), (x0 + 29 * unit, centre_y)],
+                          fill=(255, 255, 255), width=max(3, int(8 * unit)))
             draw.line([(x0 + 9 * unit, centre_y), (x0 + 29 * unit, centre_y)],
                       fill=entry[2] if len(entry) > 2 else PIPE_RED,
                       width=max(2, int(4 * unit)))
@@ -1813,10 +1886,110 @@ def aerial_geometry(latitude: float, span_feet: float, width: int,
     return zoom, factor, target_mpp
 
 
+FALLBACK_COLOURS = [(255, 140, 0), (0, 200, 255), (170, 60, 255), (60, 220, 60),
+                    (255, 255, 0), (255, 80, 200), (0, 120, 255)]
+
+
+def _colour_gap(a, b) -> float:
+    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+
+def assign_line_colours(pipeline) -> list:
+    """One colour per line: the KMZ's own, or a distinct one where it has none.
+
+    A line the KMZ leaves uncoloured used to fall back to red, which collided with
+    a line that really is red; it now gets a palette colour unlike the others.
+    """
+    colours = getattr(pipeline, "line_colours", None) or []
+    result = [tuple(colours[i]) if i < len(colours) and colours[i] else None
+              for i in range(len(pipeline.lines))]
+    used = [c for c in result if c]
+    for index, colour in enumerate(result):
+        if colour:
+            continue
+        pick = max(FALLBACK_COLOURS,
+                   key=lambda c: min([_colour_gap(c, u) for u in used] or [999]))
+        result[index] = pick
+        used.append(pick)
+    return result
+
+
+def _label_line(draw, runs, text, dig_x, dig_y, width, height, scale):
+    """Put the pipeline's name beside its line, clear of the dig's pin and label."""
+    font = _font(int(22 * scale))
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    text_w, text_h = right - left, bottom - top
+    best, best_score = None, None
+    for points in runs:
+        for (x1, y1), (x2, y2) in zip(points, points[1:]):
+            for t in (0.25, 0.5, 0.75):
+                x, y = x1 + (x2 - x1) * t, y1 + (y2 - y1) * t
+                gap = math.hypot(x - dig_x, y - dig_y)
+                if gap < 150 * scale:
+                    continue
+                box_x = x - text_w / 2
+                box_y = y - 30 * scale - text_h
+                if (box_x < 6 * scale or box_x + text_w > width - 6 * scale
+                        or box_y < 70 * scale or box_y + text_h > height - 70 * scale):
+                    continue
+                score = abs(gap - 260 * scale)
+                if best_score is None or score < best_score:
+                    best, best_score = (x, y, box_x, box_y), score
+    if best is None:
+        return
+    x, y, box_x, box_y = best
+    draw.line([(x, y - 4 * scale), (x, box_y + text_h + 4 * scale)],
+              fill=(255, 255, 255, 255), width=max(2, int(2 * scale)))
+    _outlined_text(draw, (box_x, box_y), text, font, weight=max(1, int(2 * scale)))
+
+
 def _line_colour(pipeline, index: int) -> tuple:
     colours = getattr(pipeline, "line_colours", None) or []
     colour = colours[index] if index < len(colours) else None
     return tuple(colour) if colour else PIPE_RED
+
+
+def _norm_name(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _distance_to_line_feet(line, lat, lon) -> float:
+    best = float("inf")
+    cos = math.cos(math.radians(lat))
+    for x, y in line:
+        d = math.hypot((y - lat) * 364000.0, (x - lon) * 364000.0 * cos)
+        best = min(best, d)
+    return best
+
+
+def dig_line_index(pipeline, dig) -> Optional[int]:
+    """Which KMZ line is the dig's own pipeline.
+
+    Matched by Line ID (PipelineNumber), then by the line name on the dig sheet,
+    and last by being the nearest line to the dig (within 300 ft).
+    """
+    if pipeline is None or not pipeline.lines:
+        return None
+    info = asset_info(dig) if hasattr(dig, "header") else AssetInfo()
+    ids = getattr(pipeline, "line_ids", None) or []
+    wanted = _norm_name(info.line_id)
+    if wanted:
+        for index, value in enumerate(ids):
+            if _norm_name(value) == wanted:
+                return index
+    names = [_norm_name(n) for n in pipeline.line_names]
+    for target in (_norm_name(info.line_name), _norm_name(info.segment_name)):
+        if target:
+            for index, name in enumerate(names):
+                if name and (name == target or name in target or target in name):
+                    return index
+    if dig.latitude is None or dig.longitude is None:
+        return None
+    nearest = min(range(len(pipeline.lines)),
+                  key=lambda i: _distance_to_line_feet(pipeline.lines[i], dig.latitude, dig.longitude))
+    if _distance_to_line_feet(pipeline.lines[nearest], dig.latitude, dig.longitude) <= 300:
+        return nearest
+    return None
 
 
 def _line_runs(line, centre_lat, centre_lon, span_feet):
@@ -1923,23 +2096,49 @@ def render_aerial(
     # --- pipeline centerline ---------------------------------------------
     # Each line keeps the colour it has in the KMZ (the loop and the mainline are
     # different colours there); a line with no colour of its own falls back to red.
+    dig_line = dig_line_index(pipeline, dig)
+    dig_label_spot = None
     if pipeline is not None and pipeline.lines:
-        drawn = []
+        colours = assign_line_colours(pipeline)
+        runs_by_line = {}
         for index, line in enumerate(pipeline.lines):
-            colour = _line_colour(pipeline, index)
-            drew_line = False
-            for run in _line_runs(line, latitude, longitude, span_feet):
-                points = [project(lon, lat) for lon, lat in run]
-                draw.line(points, fill=colour, width=max(4, int(4 * scale)),
+            projected = [[project(lon, lat) for lon, lat in run]
+                         for run in _line_runs(line, latitude, longitude, span_feet)]
+            if projected:
+                runs_by_line[index] = projected
+
+        def name_of(index):
+            return (pipeline.line_names[index] if index < len(pipeline.line_names)
+                    and pipeline.line_names[index] else pipeline.pipeline_label)
+
+        # Other lines first and thinner; the dig's own line last, thick, with a
+        # white halo so it reads as the pipeline the report is about.
+        thin = max(3, int(3 * scale))
+        for index, projected in runs_by_line.items():
+            if index == dig_line:
+                continue
+            for points in projected:
+                draw.line(points, fill=colours[index] + (215,), width=thin, joint="curve")
+        if dig_line in runs_by_line:
+            heavy = max(6, int(7 * scale))
+            for points in runs_by_line[dig_line]:
+                draw.line(points, fill=(255, 255, 255, 255), width=heavy + max(4, int(5 * scale)),
                           joint="curve")
-                drew_line = True
-            if drew_line:
-                label = (pipeline.line_names[index] if index < len(pipeline.line_names)
-                         and pipeline.line_names[index] else pipeline.pipeline_label)
-                if (label, colour) not in drawn:
-                    drawn.append((label, colour))
-        for label, colour in drawn:
-            legend_entries.append((label, "line", colour))
+            for points in runs_by_line[dig_line]:
+                draw.line(points, fill=colours[dig_line], width=heavy, joint="curve")
+            dig_label_spot = runs_by_line[dig_line]
+
+        drawn = []
+        if dig_line in runs_by_line:
+            drawn.append((name_of(dig_line) + " (this dig)", colours[dig_line], True))
+        for index in runs_by_line:
+            if index == dig_line:
+                continue
+            entry = (name_of(index), colours[index], False)
+            if all(entry[:2] != d[:2] for d in drawn):
+                drawn.append(entry)
+        for label, colour, bold in drawn:
+            legend_entries.append((label, "line", colour, bold))
 
     # Everything else goes on its own layer so the legend can be placed where
     # it covers the least (pin, flags and labels matter most, lines less).
@@ -1991,6 +2190,12 @@ def render_aerial(
         _outlined_text(draw, (label_x, ay - 48 * scale), label, label_font,
                        weight=max(1, int(2 * scale)))
         legend_entries.append((label, "flag"))
+
+    # --- name the dig's own pipeline right on the picture -------------------
+    if dig_line is not None and dig_label_spot:
+        label_text = (pipeline.line_names[dig_line] if dig_line < len(pipeline.line_names)
+                      and pipeline.line_names[dig_line] else pipeline.pipeline_label)
+        _label_line(draw, dig_label_spot, label_text, dig_x, dig_y, width, height, scale)
 
     # --- the dig ----------------------------------------------------------
     _draw_pin(draw, dig_x, dig_y, scale)
@@ -3023,7 +3228,12 @@ def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
         "E5": (f"Line ID {info.line_id} /ASMT ID {info.assessment_id}"
                if info.line_id and info.assessment_id else None),
         "C9": info.dig_number or None,
+        "U6": _number(dig.us_weld_id) if _number(dig.us_weld_id) is not None else (dig.us_weld_id or None),
+        "U7": station_label(dig.us_weld_station_ft) if dig.us_weld_station_ft is not None else None,
+        "U8": _number(dig.ds_weld_id) if _number(dig.ds_weld_id) is not None else (dig.ds_weld_id or None),
+        "U9": station_label(dig.ds_weld_station_ft) if dig.ds_weld_station_ft is not None else None,
     }
+    cells = {k: (int(v) if isinstance(v, float) and v.is_integer() else v) for k, v in cells.items()}
     missing = patcher.set_values(PROFILE_SHEET, cells, literal=True)
     if missing:
         warnings.append("Could not place these profile cells: " + ", ".join(sorted(missing)))
