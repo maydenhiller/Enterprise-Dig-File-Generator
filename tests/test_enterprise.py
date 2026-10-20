@@ -283,3 +283,11 @@ def test_as_built_drawing():
     sizes = re.findall(r"<Row IX='0'><Cell N='Style' V='21'/><Cell N='Size' V='([\d.]+)'", xml2)
     assert float(sizes[0]) < 24 / 72
     assert app.as_built_name(d) == "AID 257/As-Builts/As-Built Dig #06B.vsdx"
+
+
+def test_missing_weld_is_worked_out_from_the_other_one():
+    digs = app.parse_dig_package(find("AID_116"), "x_AID_116.xlsm")
+    d = next(x for x in digs if x.number == "10A")
+    assert (d.us_weld_id, d.us_weld_station_ft) == ("601000", 1136153)
+    assert (d.ds_weld_id, d.ds_weld_station_ft) == ("602000", 1136204)   # 1136153 + 51.34 ft joint
+    assert any("worked out" in w for w in d.warnings)
