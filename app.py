@@ -1130,25 +1130,63 @@ def read_site_ref_welds(workbook) -> list:
     return welds
 
 
+def _neighbour_weld_id(dig: Dig, known_id: str, step: int) -> str:
+    """The weld number next to ``known_id`` in the dig sheet's own weld table (S34:S45)."""
+    numbers = []
+    for row in range(34, 46):
+        value = _number(dig.cells.get(f"S{row}"))
+        if value is not None:
+            numbers.append(_text(int(value)))
+    if known_id in numbers:
+        index = numbers.index(known_id) + step
+        if 0 <= index < len(numbers):
+            return numbers[index]
+    return ""
+
+
 def assign_welds(dig: Dig, welds: list) -> None:
-    """Fill the dig's U/S and D/S weld IDs and stationing from the Site Ref welds."""
+    """Fill the dig's U/S and D/S weld IDs and stationing from the Site Ref welds.
+
+    A weld the Site Ref tabs do not list is worked out from the other one: its
+    stationing is the known weld's plus (or minus) the joint length, and its
+    number is the neighbour in the dig sheet's weld table.
+    """
     if dig.odometer is None:
         return
+    missing = []
     for side, distance, sign in (("us", dig.us_weld_distance, -1),
                                  ("ds", dig.ds_weld_distance, 1)):
         if distance is None:
+            missing.append(side)
             continue
         target = dig.odometer + sign * distance
         near = [w for w in welds if abs(w[0] - target) <= WELD_MATCH_FEET]
         if not near:
-            dig.warnings.append(f"No {side.upper()} weld found on the Site Ref tabs "
-                                f"near odometer {target:.2f}.")
+            missing.append(side)
             continue
         odometer, gw, station, lat, lon = min(near, key=lambda w: abs(w[0] - target))
         setattr(dig, f"{side}_weld_id", gw)
         setattr(dig, f"{side}_weld_station_ft", station)
         setattr(dig, f"{side}_weld_lat", lat)
         setattr(dig, f"{side}_weld_lon", lon)
+
+    for side in missing:
+        other = "us" if side == "ds" else "ds"
+        other_station = getattr(dig, f"{other}_weld_station_ft")
+        other_id = getattr(dig, f"{other}_weld_id")
+        if other_station is None or dig.joint_length is None:
+            dig.warnings.append(f"No {side.upper()} weld found on the Site Ref tabs.")
+            continue
+        # Downstream is up the odometer; stationing follows it or runs against it.
+        along = 1 if side == "ds" else -1
+        direction = 1 if dig.station_ascends else -1
+        station = int(round(other_station + along * direction * dig.joint_length))
+        setattr(dig, f"{side}_weld_station_ft", station)
+        setattr(dig, f"{side}_weld_id", _neighbour_weld_id(dig, other_id, along))
+        dig.warnings.append(
+            f"{side.upper()} weld is not on the Site Ref tabs; worked out from the "
+            f"{other.upper()} weld and the {dig.joint_length} ft joint length "
+            f"(station {station_label(station)}).")
 
 
 def parse_dig_package(data: bytes, filename: str) -> list:
