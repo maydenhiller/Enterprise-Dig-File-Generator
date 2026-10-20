@@ -1891,7 +1891,7 @@ def _colour_gap(a, b) -> float:
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
-def assign_line_colours(pipeline) -> list:
+def assign_line_colours(pipeline, dig_line=None) -> list:
     """One colour per line: the KMZ's own, or a distinct one where it has none.
 
     A line the KMZ leaves uncoloured used to fall back to red, which collided with
@@ -1900,6 +1900,8 @@ def assign_line_colours(pipeline) -> list:
     colours = getattr(pipeline, "line_colours", None) or []
     result = [tuple(colours[i]) if i < len(colours) and colours[i] else None
               for i in range(len(pipeline.lines))]
+    if dig_line is not None and 0 <= dig_line < len(result):
+        result[dig_line] = PIPE_RED          # the dig's own line is always red
     used = [c for c in result if c]
     for index, colour in enumerate(result):
         if colour:
@@ -2096,7 +2098,7 @@ def render_aerial(
     dig_line = dig_line_index(pipeline, dig)
     dig_label_spot = None
     if pipeline is not None and pipeline.lines:
-        colours = assign_line_colours(pipeline)
+        colours = assign_line_colours(pipeline, dig_line)
         runs_by_line = {}
         for index, line in enumerate(pipeline.lines):
             projected = [[project(lon, lat) for lon, lat in run]
