@@ -128,6 +128,10 @@ class Dig:
     us_weld_station_ft: Optional[int] = None
     ds_weld_id: str = ""
     ds_weld_station_ft: Optional[int] = None
+    us_weld_lat: Optional[float] = None           # Site Ref LAT/LON of those welds
+    us_weld_lon: Optional[float] = None
+    ds_weld_lat: Optional[float] = None
+    ds_weld_lon: Optional[float] = None
     ds_weld_distance: Optional[float] = None      # I33
     joint_length: Optional[float] = None
     latitude: Optional[float] = None
@@ -154,6 +158,28 @@ class Dig:
     warnings: list = field(default_factory=list)
 
     # --- convenience -----------------------------------------------------
+    @property
+    def flow_bearing(self) -> Optional[float]:
+        """Compass bearing (degrees clockwise from north) the product flows, U/S -> D/S.
+
+        From the two welds either side of the dig; the U/S and D/S reference
+        points are the fallback when the Site Ref tab has no coordinates.
+        """
+        for a_lat, a_lon, b_lat, b_lon in (
+            (self.us_weld_lat, self.us_weld_lon, self.ds_weld_lat, self.ds_weld_lon),
+            (self.us_ref_lat, self.us_ref_lon, self.ds_ref_lat, self.ds_ref_lon),
+        ):
+            if None in (a_lat, a_lon, b_lat, b_lon):
+                continue
+            if (a_lat, a_lon) == (b_lat, b_lon):
+                continue
+            p1, p2 = math.radians(a_lat), math.radians(b_lat)
+            dl = math.radians(b_lon - a_lon)
+            x = math.sin(dl) * math.cos(p2)
+            y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+            return math.degrees(math.atan2(x, y)) % 360.0
+        return None
+
     @property
     def upstream_reference(self) -> str:
         return reference_name(self.us_ref) or ""
@@ -1091,14 +1117,16 @@ def read_site_ref_welds(workbook) -> list:
     for name in workbook.sheetnames:
         if not SITE_REF_RE.match(name) or "Template" in name:
             continue
-        for row in workbook[name].iter_rows(min_row=2, max_col=24, values_only=True):
+        for row in workbook[name].iter_rows(min_row=2, max_col=29, values_only=True):
             if len(row) < 24 or str(row[4] or "").strip().upper() != "WELD":
                 continue
             odometer, station = _number(row[6]), _station(row[7])
             gw = row[23]
             if odometer is None or gw in (None, ""):
                 continue
-            welds.append((odometer, _text(gw), station))
+            lat = _number(row[27]) if len(row) > 28 else None
+            lon = _number(row[28]) if len(row) > 28 else None
+            welds.append((odometer, _text(gw), station, lat, lon))
     return welds
 
 
@@ -1116,9 +1144,11 @@ def assign_welds(dig: Dig, welds: list) -> None:
             dig.warnings.append(f"No {side.upper()} weld found on the Site Ref tabs "
                                 f"near odometer {target:.2f}.")
             continue
-        odometer, gw, station = min(near, key=lambda w: abs(w[0] - target))
+        odometer, gw, station, lat, lon = min(near, key=lambda w: abs(w[0] - target))
         setattr(dig, f"{side}_weld_id", gw)
         setattr(dig, f"{side}_weld_station_ft", station)
+        setattr(dig, f"{side}_weld_lat", lat)
+        setattr(dig, f"{side}_weld_lon", lon)
 
 
 def parse_dig_package(data: bytes, filename: str) -> list:
@@ -3212,6 +3242,279 @@ def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
 
 
 # ==========================================================================
+# ASBUILT
+# ==========================================================================
+# The As-Built drawing (.vsdx), one per dig.
+#
+# A Visio file is a zip of XML parts, so it is patched the way the xlsm is: the
+# template's page1.xml is edited in place and nothing else is touched. What is
+# filled, by shape ID in the Enterprise template:
+#
+#   264  title block (pipeline, section, LID/AID, dig #) - narrowed to sit between
+#        the two logos, and the font shrunk per line so it never runs under one
+#   193 / 222  D/S and U/S weld callouts (weld number, stationing)
+#   294  the compass rose inside the Gibson box - turned so north is where it
+#        really is when the pipe is drawn with flow running up the page
+#   289  the lower-right job box (county ... alignment sheet; D.O.C, prepared by
+#        and date are left for the person to fill in)
+#
+# The callouts and dimension shapes in the lower left are left exactly as the
+# template has them.
+
+VSDX_PAGE = "visio/pages/page1.xml"
+TITLE_SHAPE, DS_WELD_SHAPE, US_WELD_SHAPE = "264", "193", "222"
+COMPASS_SHAPE, JOB_BOX_SHAPE = "294", "289"
+LOGO_SHAPES = ("224", "228")
+TITLE_SIZES_PT = (24.0, 24.0, 18.0, 24.0)     # pipeline, section, LID/AID, dig #
+TITLE_SIDE_GAP_IN = 0.1
+TITLE_MARGIN_IN = 0.1
+JOB_BOX_LINES = {
+    "County": "county_state", "Legal": "legal_description", "Tract": "tract_number",
+    "Aerial": "aerial_marker", "Milepost": "milepost", "Alignment": "alignment_sheet",
+}
+_CARLITO_BOLD = ["/usr/share/fonts/truetype/crosextra/Carlito-Bold.ttf",
+                 "/usr/share/fonts/carlito/Carlito-Bold.ttf"]
+_ARIAL_FILES = {False: ["/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"],
+                True: ["/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                       "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"]}
+_FONT_CACHE: dict = {}
+
+
+def _measure(text: str, size_pt: float, files: list, key: str) -> float:
+    """Width in inches of ``text`` at ``size_pt`` in the first font file that opens."""
+    if key not in _FONT_CACHE:
+        _FONT_CACHE[key] = None
+        for path in files:
+            try:
+                _FONT_CACHE[key] = ImageFont.truetype(path, 200)
+                break
+            except OSError:
+                continue
+    font = _FONT_CACHE[key]
+    if font is None:
+        return len(text) * size_pt / 72.0 * 0.58      # a little wide, so it errs small
+    return font.getlength(text) * size_pt / 200.0 / 72.0
+
+
+def fit_size(text: str, base_pt: float, width_in: float, measure, minimum: float = 6.0) -> float:
+    """The largest size up to ``base_pt`` at which ``text`` is no wider than ``width_in``."""
+    full = measure(text, base_pt)
+    if full <= width_in or full <= 0:
+        return base_pt
+    return max(minimum, round(base_pt * width_in / full * 2 - 0.5) / 2)
+
+
+def _shape_span(xml: str, shape_id: str):
+    match = re.search(rf"<Shape ID='{shape_id}'.*?</Shape>", xml, re.S)
+    return (match.start(), match.end()) if match else None
+
+
+def _cell_value(block: str, name: str) -> Optional[float]:
+    match = re.search(rf"<Cell N='{name}' V='([^']*)'", block)
+    try:
+        return float(match.group(1)) if match else None
+    except ValueError:
+        return None
+
+
+def _logo_gap(xml: str) -> Optional[tuple]:
+    """(left edge, right edge) of the free space between the two header logos."""
+    edges = []
+    for shape_id in LOGO_SHAPES:
+        span = _shape_span(xml, shape_id)
+        if not span:
+            return None
+        block = xml[span[0]:span[1]]
+        pin, width, loc = (_cell_value(block, n) for n in ("PinX", "Width", "LocPinX"))
+        if None in (pin, width, loc):
+            return None
+        edges.append((pin - loc, pin - loc + width))
+    edges.sort()
+    return edges[0][1], edges[1][0]
+
+
+def _split_title(info: "AssetInfo") -> tuple:
+    name, segment = info.line_name, info.segment_name
+    if not segment and ":" in name:
+        name, _, segment = name.partition(":")
+    return _squash(name), _squash(segment)
+
+
+def _character_rows(sizes_pt: list, first_style: int = 21) -> str:
+    rows = "".join(
+        f"<Row IX='{i}'><Cell N='Style' V='{first_style}'/>"
+        f"<Cell N='Size' V='{size / 72.0:.6f}' U='PT'/></Row>"
+        for i, size in enumerate(sizes_pt))
+    return f"<Section N='Character'>{rows}</Section>"
+
+
+def _fill_title(xml: str, dig: "Dig", info: "AssetInfo") -> tuple:
+    span = _shape_span(xml, TITLE_SHAPE)
+    if not span:
+        return xml, ["The as-built template has no title block (shape 264)."]
+    block = xml[span[0]:span[1]]
+    gap = _logo_gap(xml)
+    left, right = gap if gap else (2.375, 6.323)
+    width = max(right - left - 2 * TITLE_SIDE_GAP_IN, 1.0)
+    centre = (left + right) / 2.0
+    usable = width - 2 * TITLE_MARGIN_IN
+
+    name, segment = _split_title(info)
+    lid = f"LID: {info.line_id or '?'}  AID: {info.assessment_id or '?'}"
+    number = f"Dig # {dig.number}" if dig.number else "Dig #"
+    lines = [(name, TITLE_SIZES_PT[0]), (segment, TITLE_SIZES_PT[1]),
+             (lid, TITLE_SIZES_PT[2]), (number, TITLE_SIZES_PT[3])]
+    lines = [(t, b) for t, b in lines if t]
+
+    sizes = [fit_size(t, b, usable, lambda x, y: _measure(x, y, _CARLITO_BOLD, "carlito-bold"))
+             for t, b in lines]
+    newline = "\r\n" if "\r\n" in xml else "\n"
+    text = "".join(f"<cp IX='{i}'/>{escape(t)}{newline}" for i, (t, _) in enumerate(lines))
+    cells = (f"<Cell N='PinX' V='{centre:.6f}'/>"
+             + re.search(r"<Cell N='PinY' V='[^']*'/>", block).group(0)
+             + f"<Cell N='Width' V='{width:.6f}'/><Cell N='LocPinX' V='{width / 2:.6f}'/>")
+    new = (re.match(r"<Shape [^>]*>", block).group(0) + cells + _character_rows(sizes)
+           + f"<Text><pp IX='0'/>{text}</Text></Shape>")
+    return xml[:span[0]] + new + xml[span[1]:], []
+
+
+def _fill_weld(xml: str, shape_id: str, label: str, number: str, station_ft) -> str:
+    span = _shape_span(xml, shape_id)
+    if not span:
+        return xml
+    block = xml[span[0]:span[1]]
+    station = station_label(station_ft) if station_ft is not None else "XXX+XX"
+    first = f"{label} Weld # {number or 'XXXX'}"
+    newline = "\r\n" if "\r\n" in block else "\n"
+    block = re.sub(r"(<Text>.*?>)[^<>]*?XXXX\r?\nXXX\+XX\r?\n(</Text>)",
+                   lambda m: f"{m.group(1)}{escape(first)}{newline}{escape(station)}{newline}{m.group(2)}",
+                   block, flags=re.S)
+    return xml[:span[0]] + block + xml[span[1]:]
+
+
+def _rotate_compass(xml: str, bearing: float) -> str:
+    """Turn the rose so north lies where it does on the ground.
+
+    The drawing runs flow up the page, so up is the flow bearing; north is then
+    that far round the other way, and Visio angles count counter-clockwise.
+    """
+    match = re.search(rf"<Shape ID='{COMPASS_SHAPE}'[^>]*>", xml)
+    if not match:
+        return xml
+    tag = match.group(0)
+    angle = f"<Cell N='Angle' V='{math.radians(bearing):.10f}'/>"
+    return xml[:match.end()] + angle + xml[match.end():]
+
+
+def _master_text(zf: zipfile.ZipFile, master_id: str) -> Optional[str]:
+    try:
+        masters = zf.read("visio/masters/masters.xml").decode("utf-8")
+        rels = zf.read("visio/masters/_rels/masters.xml.rels").decode("utf-8")
+        block = re.search(rf"<Master ID='{master_id}'.*?</Master>", masters, re.S).group(0)
+        rid = re.search(r"<Rel r:id='(\w+)'", block).group(1)
+        target = re.search(rf'<Relationship [^>]*Id="{rid}"[^>]*Target="([^"]+)"', rels)
+        if not target:
+            target = re.search(rf'<Relationship [^>]*Target="([^"]+)"[^>]*Id="{rid}"', rels)
+        part = zf.read("visio/masters/" + target.group(1)).decode("utf-8")
+        match = re.search(r"<Text>(.*?)</Text>", part, re.S)
+        return match.group(1) if match else None
+    except (KeyError, AttributeError):
+        return None
+
+
+def _job_box_values(dig: "Dig") -> dict:
+    cells = dig.cells
+
+    def pick(ref):
+        value = cells.get(ref)
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        return "" if value is None else str(value).strip()
+
+    milepost = _number(cells.get("C40"))
+    return {
+        "county_state": pick("C36"), "legal_description": pick("C37"),
+        "tract_number": pick("C38"), "aerial_marker": pick("C39"),
+        "milepost": f"{milepost:.2f}" if milepost is not None else "",
+        "alignment_sheet": pick("C41"),
+    }
+
+
+def _fill_job_box(xml: str, zf: zipfile.ZipFile, dig: "Dig") -> tuple:
+    span = _shape_span(xml, JOB_BOX_SHAPE)
+    if not span:
+        return xml, ["The as-built template has no job information box (shape 289)."]
+    block = xml[span[0]:span[1]]
+    master = re.search(r"Master='(\d+)'", block)
+    template_text = _master_text(zf, master.group(1)) if master else None
+    if not template_text:
+        return xml, ["Could not read the job information box text from the as-built template."]
+
+    values = _job_box_values(dig)
+    box_length = 3.42 - 0.25
+    sizes: dict = {}
+    out_lines, warnings = [], []
+    newline = "\r\n" if "\r\n" in template_text else "\n"
+    for line in template_text.replace("\r\n", "\n").split("\n"):
+        plain = re.sub(r"<[^>]*>", "", line)
+        key = next((k for label, k in JOB_BOX_LINES.items() if plain.lstrip().startswith(label)), None)
+        if key is not None:
+            value = values.get(key, "")
+            if value:
+                line = re.sub(r"\?+(?:\.\?+)?", lambda m: escape(value), line, count=1)
+                plain = re.sub(r"<[^>]*>", "", line)
+            else:
+                warnings.append(f"The dig sheet has no {key.replace('_', ' ')}; left as the template has it.")
+            size = fit_size(plain, 10.0, box_length,
+                            lambda x, y: _measure(x, y, _ARIAL_FILES[True], "arial-bold") * 0.96)
+            if size < 10.0:
+                for cp in re.findall(r"<cp IX='(\d+)'/>", line):
+                    sizes[int(cp)] = size
+        out_lines.append(line)
+    rows = "".join(f"<Row IX='{i}'><Cell N='Size' V='{s / 72.0:.6f}' U='PT'/></Row>"
+                   for i, s in sorted(sizes.items()))
+    section = f"<Section N='Character'>{rows}</Section>" if rows else ""
+    block = block.replace("</Shape>", f"{section}<Text>{newline.join(out_lines)}</Text></Shape>")
+    return xml[:span[0]] + block + xml[span[1]:], warnings
+
+
+def build_as_built(template_bytes: bytes, dig: "Dig") -> tuple:
+    """Return (.vsdx bytes, warnings): the template with this dig's details filled in."""
+    info = asset_info(dig)
+    warnings = []
+    if not info.line_id or not info.assessment_id:
+        warnings.append("Could not read the Line ID / assessment ID from the dig sheet title.")
+    source = zipfile.ZipFile(io.BytesIO(template_bytes))
+    if VSDX_PAGE not in source.namelist():
+        raise ValueError("The as-built template is not a Visio drawing (.vsdx).")
+    xml = source.read(VSDX_PAGE).decode("utf-8")
+
+    xml, problems = _fill_title(xml, dig, info)
+    warnings.extend(problems)
+    if not dig.us_weld_id or not dig.ds_weld_id:
+        warnings.append("U/S or D/S weld number not found; that callout was left as the template has it.")
+    xml = _fill_weld(xml, US_WELD_SHAPE, "U/S", dig.us_weld_id, dig.us_weld_station_ft)
+    xml = _fill_weld(xml, DS_WELD_SHAPE, "D/S", dig.ds_weld_id, dig.ds_weld_station_ft)
+
+    bearing = dig.flow_bearing
+    if bearing is None:
+        warnings.append("No coordinates to work out the flow direction; the compass was not turned.")
+    else:
+        xml = _rotate_compass(xml, bearing)
+    xml, problems = _fill_job_box(xml, source, dig)
+    warnings.extend(problems)
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            data = xml.encode("utf-8") if item.filename == VSDX_PAGE else source.read(item.filename)
+            target.writestr(item, data)
+    return buffer.getvalue(), warnings
+
+
+
+# ==========================================================================
 # GENERATION
 # ==========================================================================
 # The whole run, kept out of the UI so it can be exercised by the tests.
@@ -3243,6 +3546,10 @@ def profile_report_name(dig: Dig) -> str:
     return f"{folder_for(dig)}/Profile Reports/Profile Dig #{_file_part(dig.number)}.xlsx"
 
 
+def as_built_name(dig: Dig) -> str:
+    return f"{folder_for(dig)}/As-Builts/As-Built Dig #{_file_part(dig.number)}.vsdx"
+
+
 def cheat_sheet_name(package_id: str) -> str:
     return f"AID {_file_part(package_id)}/AID {_file_part(package_id)} - Dig Stake Cheat Sheet.xlsx"
 
@@ -3268,6 +3575,7 @@ def generate_files(
     progress=None,
     excavation_template: Optional[bytes] = None,
     profile_template: Optional[bytes] = None,
+    as_built_template: Optional[bytes] = None,
 ) -> tuple:
     """Return ({path: bytes}, [issues]) for the chosen digs.
 
@@ -3336,6 +3644,16 @@ def generate_files(
                     issues.extend(f"{dig.name} (AID {dig.package_id}): {w}" for w in sheet_warnings)
             except Exception as error:  # noqa: BLE001
                 issues.append(f"{dig.name} (AID {dig.package_id}): profile failed - {error}")
+
+        if as_built_template:
+            tick((index - 0.02) / total, f"{dig.name} (AID {dig.package_id}) - as-built")
+            try:
+                drawing, drawing_warnings = build_as_built(as_built_template, dig)
+                outputs[as_built_name(dig)] = drawing
+                issues.extend(f"{dig.name} (AID {dig.package_id}): as-built - {w}"
+                              for w in drawing_warnings)
+            except Exception as error:  # noqa: BLE001
+                issues.append(f"{dig.name} (AID {dig.package_id}): as-built failed - {error}")
 
     # One cheat sheet per package: the packages are separate assessments, so
     # their odometers are not on one scale.
@@ -3425,6 +3743,10 @@ def main() -> None:
             "Profile template (.xlsx) - optional", type=["xlsx"], key="profile",
             help="Enterprise's dig profile workbook. One is filled for every dig.",
         )
+    as_built_file = st.file_uploader(
+        "As-Built template (.vsdx) - optional", type=["vsdx"], key="as_built",
+        help="Enterprise's As-Built drawing. One is filled for every dig, in an As-Builts folder.",
+    )
     if excavation_file is not None:
         try:
             from pypdf import PdfReader
@@ -3634,6 +3956,7 @@ def main() -> None:
             progress=lambda fraction, text: bar.progress(fraction, text=text),
             excavation_template=excavation_file.getvalue() if excavation_file else None,
             profile_template=profile_file.getvalue() if profile_file else None,
+            as_built_template=as_built_file.getvalue() if as_built_file else None,
         )
         bar.empty()
         st.session_state.outputs = outputs
