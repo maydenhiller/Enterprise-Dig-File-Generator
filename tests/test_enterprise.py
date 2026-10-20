@@ -161,3 +161,63 @@ def test_line_colours_come_from_kmz():
     pixels = list(img.getdata())
     assert any(r > 200 and g < 60 and b < 60 for r, g, b in pixels)      # red line drawn
     assert any(r > 200 and g > 200 and b < 90 for r, g, b in pixels)     # yellow line drawn
+
+
+def test_long_text_is_fitted_to_its_boxes(digs):
+    import openpyxl
+    tpl = find("Autopopulates")
+    d = next(x for x in digs[1] if x.number == "05A")
+    short = "Turn left on Main Street."
+    long = ("Drive north on the highway and continue traveling for several miles. " * 12).strip()
+    assert app.fit_font_size(short, 500, 100) == 11.0
+    assert 6.0 <= app.fit_font_size(long, 500, 100) < 11.0
+    d.directions = long
+    d.cells["C41"] = "A-VERY-LONG-ALIGNMENT-SHEET-NAME-THAT-WILL-NOT-FIT-IN-ONE-LINE.pdf"
+    out, warn = app.build_staking_report(tpl, d, app.ReportSettings("Hayden Miller"),
+                                         app.read_template_info(tpl).phones)
+    assert not warn
+    z = zipfile.ZipFile(io.BytesIO(out))
+    styles = z.read("xl/styles.xml").decode()
+    assert 'shrinkToFit="1"' in styles
+    sheet = z.read("xl/worksheets/sheet1.xml").decode()
+    import re
+    def style_of(ref):
+        return int(re.search(rf'<c r="{ref}"[^>]*? s="(\d+)"', sheet).group(1))
+    xfs = re.findall(r"<xf\b[^>]*?/>|<xf\b[^>]*?>.*?</xf>",
+                     re.search(r"<cellXfs\b.*?</cellXfs>", styles, re.S).group(0), re.S)
+    assert "shrinkToFit" in xfs[style_of("C23")]                       # one-line cell
+    fonts = re.findall(r"<font\b[^>]*?/>|<font\b[^>]*?>.*?</font>",
+                       re.search(r"<fonts\b.*?</fonts>", styles, re.S).group(0), re.S)
+    font_id = int(re.search(r'fontId="(\d+)"', xfs[style_of("A28")]).group(1))
+    assert float(re.search(r'<sz val="([\d.]+)"', fonts[font_id]).group(1)) < 11   # wrapped box
+    openpyxl.load_workbook(io.BytesIO(out))                             # still a valid workbook
+
+
+def test_legend_does_not_cover_the_dig():
+    from PIL import Image
+    from types import SimpleNamespace as NS
+    lat, lon = 29.936451, -94.297241
+    pipeline = app.PipelineData()
+    for i in range(7):
+        offset = (i - 3) * 0.00022
+        pipeline.lines.append([(lon - 0.01, lat + offset), (lon + 0.01, lat + offset)])
+        pipeline.line_names.append(f"A fairly long pipeline name number {i}")
+        pipeline.line_colours.append((255, 0, 0))
+    dig = NS(latitude=lat, longitude=lon, name="Dig # 06B", upstream_reference=None,
+             downstream_reference=None, us_ref_lat=None, us_ref_lon=None,
+             ds_ref_lat=None, ds_ref_lon=None, package_id="1", feature_id="1")
+    real = app._basemap_image
+    app._basemap_image = lambda view, url, token: (Image.new("RGB", (view.width, view.height), (60, 80, 50)), 1)
+    try:
+        jpeg = app.render_aerial(dig, pipeline, width=1600, slot_aspect=1600 / 835)
+    finally:
+        app._basemap_image = real
+    img = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    width, height = img.size
+    # The dig pin sits at the centre and its yellow must still be visible there.
+    r, g, b = img.getpixel((width // 2, height // 2 - 52))
+    assert r > 200 and g > 170 and b < 80
+    # The legend takes a modest part of the picture, not most of it.
+    light = sum(1 for px in img.crop((0, 0, width, height)).resize((160, 84)).getdata()
+                if min(px) > 220)
+    assert light < 160 * 84 * 0.25
