@@ -1883,36 +1883,6 @@ def aerial_geometry(latitude: float, span_feet: float, width: int,
     return zoom, factor, target_mpp
 
 
-FALLBACK_COLOURS = [(255, 140, 0), (0, 200, 255), (170, 60, 255), (60, 220, 60),
-                    (255, 255, 0), (255, 80, 200), (0, 120, 255)]
-
-
-def _colour_gap(a, b) -> float:
-    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
-
-
-def assign_line_colours(pipeline, dig_line=None) -> list:
-    """One colour per line: the KMZ's own, or a distinct one where it has none.
-
-    A line the KMZ leaves uncoloured used to fall back to red, which collided with
-    a line that really is red; it now gets a palette colour unlike the others.
-    """
-    colours = getattr(pipeline, "line_colours", None) or []
-    result = [tuple(colours[i]) if i < len(colours) and colours[i] else None
-              for i in range(len(pipeline.lines))]
-    if dig_line is not None and 0 <= dig_line < len(result):
-        result[dig_line] = PIPE_RED          # the dig's own line is always red
-    used = [c for c in result if c]
-    for index, colour in enumerate(result):
-        if colour:
-            continue
-        pick = max(FALLBACK_COLOURS,
-                   key=lambda c: min([_colour_gap(c, u) for u in used] or [999]))
-        result[index] = pick
-        used.append(pick)
-    return result
-
-
 def _label_line(draw, runs, text, dig_x, dig_y, width, height, scale):
     """Put the pipeline's name beside its line, clear of the dig's pin and label."""
     font = _font(int(22 * scale))
@@ -2098,7 +2068,7 @@ def render_aerial(
     dig_line = dig_line_index(pipeline, dig)
     dig_label_spot = None
     if pipeline is not None and pipeline.lines:
-        colours = assign_line_colours(pipeline, dig_line)
+        colours = [_line_colour(pipeline, i) for i in range(len(pipeline.lines))]   # exactly as the KMZ has them
         runs_by_line = {}
         for index, line in enumerate(pipeline.lines):
             projected = [[project(lon, lat) for lon, lat in run]
