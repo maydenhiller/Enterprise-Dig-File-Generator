@@ -3380,9 +3380,24 @@ def _split_title(info: "AssetInfo") -> tuple:
 
 
 def _character_rows(sizes_pt: list, first_style: int = 21) -> str:
+    """One complete Character row per title line.
+
+    The master only defines rows 0-2; Visio gives a row beyond those zeros for
+    every cell it is not told (font scale 0 piles the letters on one spot), so
+    each row states everything.
+    """
     rows = "".join(
-        f"<Row IX='{i}'><Cell N='Style' V='{first_style}'/>"
-        f"<Cell N='Size' V='{size / 72.0:.6f}' U='PT'/></Row>"
+        f"<Row IX='{i}'>"
+        "<Cell N='Font' V='Themed' F='THEMEVAL()'/>"
+        "<Cell N='Color' V='Themed' F='THEMEVAL()'/>"
+        f"<Cell N='Style' V='{first_style}' F='THEMEVAL(\"TextStyle\",{first_style})'/>"
+        "<Cell N='Case' V='0'/><Cell N='Pos' V='0'/><Cell N='FontScale' V='1'/>"
+        f"<Cell N='Size' V='{size / 72.0:.6f}' U='PT'/>"
+        "<Cell N='DblUnderline' V='0'/><Cell N='Overline' V='0'/><Cell N='Strikethru' V='0'/>"
+        "<Cell N='DoubleStrikethrough' V='0'/><Cell N='Letterspace' V='0'/>"
+        "<Cell N='ColorTrans' V='0'/><Cell N='AsianFont' V='Themed' F='THEMEVAL()'/>"
+        "<Cell N='ComplexScriptFont' V='Themed' F='THEMEVAL()'/>"
+        "<Cell N='ComplexScriptSize' V='-1'/><Cell N='LangID' V='en-US'/></Row>"
         for i, size in enumerate(sizes_pt))
     return f"<Section N='Character'>{rows}</Section>"
 
