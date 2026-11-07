@@ -3220,6 +3220,58 @@ def excavation_field_values(dig: Dig) -> tuple:
     return values, _asset_warnings(info)
 
 
+def _excavation_form_kind(reader) -> str:
+    """'xfa' for the old Adobe XFA template, 'acroform' for the plain fillable one."""
+    form = reader.trailer["/Root"].get("/AcroForm")
+    if form is None:
+        raise ValueError("This PDF has no form fields - is it the Excavation "
+                         "Survey Report template?")
+    if form.get("/XFA"):
+        return "xfa"
+    if "digNumber" not in (reader.get_fields() or {}):
+        raise ValueError("This PDF's form has no 'digNumber' field - is it the "
+                         "Excavation Survey Report template?")
+    return "acroform"
+
+
+def excavation_form_values(dig: Dig) -> tuple:
+    """({form field: value}, warnings) for the plain fillable template."""
+    info = asset_info(dig)
+    values = {
+        "pipelineCode": PIPELINE_CODE,
+        "pipelineName": info.line_name,
+        "pipelineNumber": info.line_id,
+        "assessmentID": info.assessment_id,
+        "assessmentSegmentName": info.segment_name,
+        "digNumber": info.dig_number,
+    }
+    return {name: "" if value is None else str(value) for name, value in values.items()}, \
+        _asset_warnings(info)
+
+
+def _fill_acroform(template_bytes: bytes, values: dict) -> bytes:
+    """The bytes to append to the template so its named fields hold ``values``.
+
+    An incremental update, like the XFA route: the template is not rewritten, so
+    every dig can share one copy of it and keep only its few KB of difference.
+    """
+    from pypdf import PdfWriter
+    from pypdf.generic import BooleanObject, NameObject
+
+    writer = PdfWriter(io.BytesIO(template_bytes), incremental=True)
+    for page in writer.pages:
+        if "/Annots" in page:
+            writer.update_page_form_field_values(page, values, auto_regenerate=False)
+    writer._root_object["/AcroForm"][NameObject("/NeedAppearances")] = BooleanObject(True)
+    out = io.BytesIO()
+    writer.write(out)
+    data = out.getvalue()
+    if not data.startswith(template_bytes):
+        raise ValueError("The filled PDF could not be appended to the template.")
+    return data[len(template_bytes):]
+
+
+
 def build_excavation_report(template_bytes: bytes, dig: Dig, lazy: bool = False) -> tuple:
     """Return (PDF, warnings) - the template with the asset block filled in.
 
@@ -3231,6 +3283,10 @@ def build_excavation_report(template_bytes: bytes, dig: Dig, lazy: bool = False)
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(template_bytes))
+    if _excavation_form_kind(reader) == "acroform":
+        values, warnings = excavation_form_values(dig)
+        tail = _fill_acroform(template_bytes, values)
+        return (AppendedPdf(template_bytes, tail) if lazy else template_bytes + tail), warnings
     number, generation, original = _xfa_datasets(reader)
 
     values, warnings = excavation_field_values(dig)
@@ -3803,7 +3859,7 @@ def main() -> None:
     if excavation_file is not None:
         try:
             from pypdf import PdfReader
-            _xfa_datasets(PdfReader(io.BytesIO(excavation_file.getvalue())))
+            _excavation_form_kind(PdfReader(io.BytesIO(excavation_file.getvalue())))
         except Exception as error:  # noqa: BLE001
             st.warning(f"Excavation Survey Report template: {error}")
     if profile_file is not None:
