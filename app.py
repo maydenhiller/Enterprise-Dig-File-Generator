@@ -128,6 +128,8 @@ class Dig:
     us_weld_station_ft: Optional[int] = None
     ds_weld_id: str = ""
     ds_weld_station_ft: Optional[int] = None
+    us_weld_calculated: bool = False             # station worked out, not on Site Ref
+    ds_weld_calculated: bool = False
     us_weld_lat: Optional[float] = None           # Site Ref LAT/LON of those welds
     us_weld_lon: Optional[float] = None
     ds_weld_lat: Optional[float] = None
@@ -1182,6 +1184,7 @@ def assign_welds(dig: Dig, welds: list) -> None:
         direction = 1 if dig.station_ascends else -1
         station = int(round(other_station + along * direction * dig.joint_length))
         setattr(dig, f"{side}_weld_station_ft", station)
+        setattr(dig, f"{side}_weld_calculated", True)
         setattr(dig, f"{side}_weld_id", _neighbour_weld_id(dig, other_id, along))
         dig.warnings.append(
             f"{side.upper()} weld is not on the Site Ref tabs; worked out from the "
@@ -2589,8 +2592,17 @@ def build_cheat_sheet(
         sheet.cell(top, COL_ODO).value = f"=B{anomaly}-D{top}"
         sheet.cell(bottom, COL_ODO).value = f"=B{anomaly}+D{bottom}"
         up, down = ("-", "+") if dig.station_ascends else ("+", "-")
-        sheet.cell(top, COL_STATION).value = f"=C{anomaly}{up}D{top}"
-        sheet.cell(bottom, COL_STATION).value = f"=C{anomaly}{down}D{bottom}"
+        # The weld stations are the ones printed on the Site Ref tab, not worked
+        # out from the anomaly. Only a weld the Site Ref does not list keeps the
+        # template's formula.
+        if dig.us_weld_station_ft is not None and not dig.us_weld_calculated:
+            sheet.cell(top, COL_STATION).value = dig.us_weld_station_ft
+        else:
+            sheet.cell(top, COL_STATION).value = f"=C{anomaly}{up}D{top}"
+        if dig.ds_weld_station_ft is not None and not dig.ds_weld_calculated:
+            sheet.cell(bottom, COL_STATION).value = dig.ds_weld_station_ft
+        else:
+            sheet.cell(bottom, COL_STATION).value = f"=C{anomaly}{down}D{bottom}"
 
         sheet.cell(anomaly, COL_FROM_REF).value = dig.nearest_reference_label or None
 
