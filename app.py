@@ -3315,6 +3315,18 @@ PROFILE_SHEET = "Blank"
 PROFILE_SHEET_RENAMED = "Profile"
 
 
+def _profile_sheet(names: list) -> Optional[str]:
+    """The sheet to fill: one called "Blank" if there is, otherwise the first.
+
+    Enterprise has shipped the profile template with "Blank" and "Example" sheets
+    and as a single sheet called "Sheet1"; whatever the sheet is called, it is
+    the one that gets filled and renamed "Profile".
+    """
+    if PROFILE_SHEET in names:
+        return PROFILE_SHEET
+    return names[0] if names else None
+
+
 def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
     """Return (.xlsx bytes, warnings): the template's blank sheet, header filled in."""
     info = asset_info(dig)
@@ -3322,9 +3334,9 @@ def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
 
     patcher = XlsmPatcher(template_bytes)
     names = patcher.sheet_names()
-    if PROFILE_SHEET not in names:
-        raise ValueError(f"The profile template has no '{PROFILE_SHEET}' sheet - "
-                         f"found {', '.join(names)}.")
+    sheet_name = _profile_sheet(names)
+    if sheet_name is None:
+        raise ValueError("The profile template has no sheets.")
 
     cells = {
         "E3": info.line_name,
@@ -3338,11 +3350,11 @@ def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
         "U9": station_label(dig.ds_weld_station_ft) if dig.ds_weld_station_ft is not None else None,
     }
     cells = {k: (int(v) if isinstance(v, float) and v.is_integer() else v) for k, v in cells.items()}
-    missing = patcher.set_values(PROFILE_SHEET, cells, literal=True)
+    missing = patcher.set_values(sheet_name, cells, literal=True)
     if missing:
         warnings.append("Could not place these profile cells: " + ", ".join(sorted(missing)))
 
-    patcher.keep_only_sheet(PROFILE_SHEET, rename_to=PROFILE_SHEET_RENAMED)
+    patcher.keep_only_sheet(sheet_name, rename_to=PROFILE_SHEET_RENAMED)
     patcher.force_full_recalc()
     return patcher.to_bytes(), warnings
 
@@ -3877,9 +3889,8 @@ def main() -> None:
     if profile_file is not None:
         try:
             names = XlsmPatcher(profile_file.getvalue()).sheet_names()
-            if PROFILE_SHEET not in names:
-                st.warning(f"Profile template: no '{PROFILE_SHEET}' sheet - found "
-                           f"{', '.join(names)}.")
+            if _profile_sheet(names) is None:
+                st.warning("Profile template: the workbook has no sheets.")
         except Exception as error:  # noqa: BLE001
             st.warning(f"Profile template: not a readable workbook ({error}).")
 
