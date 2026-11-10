@@ -3315,6 +3315,42 @@ PROFILE_SHEET = "Blank"
 PROFILE_SHEET_RENAMED = "Profile"
 
 
+def _rewrite_sheet_name(book: bytes, old: str, new: str) -> bytes:
+    """Rename a sheet inside a workbook file; ``old`` and ``new`` are XML-escaped.
+
+    Only xl/workbook.xml is touched: the sheet's own entry and the defined names
+    (print area and the like) that point at it.
+    """
+    source = zipfile.ZipFile(io.BytesIO(book))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
+        for item in source.infolist():
+            data = source.read(item.filename)
+            if item.filename == "xl/workbook.xml":
+                text = data.decode("utf-8")
+                text = text.replace(f'<sheet name="{old}"', f'<sheet name="{new}"', 1)
+                for quoted in (f"'{old}'!", f"{old}!"):
+                    text = text.replace(quoted, f"'{new}'!")
+                data = text.encode("utf-8")
+            target.writestr(item, data)
+    return out.getvalue()
+
+
+def _blank_profile_sheet(template_bytes: bytes) -> tuple:
+    """(template, original name): the first sheet renamed "Blank" if it is not called that.
+
+    The profile template's sheet is whatever Enterprise called it. The filling
+    code looks for "Blank", so give it that name for the work, and the original
+    name (XML-escaped, as the file spells it) is handed back to restore afterwards.
+    """
+    with zipfile.ZipFile(io.BytesIO(template_bytes)) as book:
+        workbook = book.read("xl/workbook.xml").decode("utf-8")
+    names = re.findall(r'<sheet\b[^>]*?\bname="([^"]*)"', workbook)
+    if not names or PROFILE_SHEET in names:
+        return template_bytes, None
+    return _rewrite_sheet_name(template_bytes, names[0], PROFILE_SHEET), names[0]
+
+
 def _profile_sheet(names: list) -> Optional[str]:
     """The sheet to fill: one called "Blank" if there is, otherwise the first.
 
@@ -3332,6 +3368,7 @@ def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
     info = asset_info(dig)
     warnings = _asset_warnings(info)
 
+    template_bytes, original_name = _blank_profile_sheet(template_bytes)
     patcher = XlsmPatcher(template_bytes)
     names = patcher.sheet_names()
     sheet_name = _profile_sheet(names)
@@ -3356,7 +3393,11 @@ def build_profile_report(template_bytes: bytes, dig: Dig) -> tuple:
 
     patcher.keep_only_sheet(sheet_name, rename_to=PROFILE_SHEET_RENAMED)
     patcher.force_full_recalc()
-    return patcher.to_bytes(), warnings
+    data = patcher.to_bytes()
+    if original_name:
+        # Keep the sheet name Enterprise gave the template.
+        data = _rewrite_sheet_name(data, PROFILE_SHEET_RENAMED, original_name)
+    return data, warnings
 
 
 # ==========================================================================
