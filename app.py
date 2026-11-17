@@ -3738,6 +3738,94 @@ class RunOptions:
     auto_notes: bool = True
 
 
+# ==========================================================================
+# ROBOTIC LASER PROFILES
+# ==========================================================================
+# With the laser box ticked, the profile report is replaced by two of Enterprise's
+# laser workbooks: a Consistency Check (made three times, Profile 0, 1 and 2, with
+# its own Profile No.) and a Pipe Movement Calculation (once). Only their
+# heading cells are filled; the measurements are the technician's.
+
+LASER_CONSISTENCY_SHEET = "Robotic Raw Data Input"
+LASER_MOVEMENT_SHEET = "Robotic Raw Data Average Input"
+LASER_PROFILES = (0, 1, 2)
+LASER_FOLDER = "Laser Reports"
+
+
+def pipe_size(dig: Dig) -> tuple:
+    """(OD in, wall in, SMYS psi) from the dig sheet's 'Size:' line, None where missing.
+
+    The line reads like "4.5 inch - 0.156 inch wt - 42000 PSI".
+    """
+    text = _text(dig.cells.get("C46"))
+    match = re.search(r"([\d.]+)\s*inch\s*-\s*([\d.]+)\s*inch\s*wt\s*-\s*([\d.,]+)\s*PSI",
+                      text, re.I)
+    if not match:
+        return None, None, None
+    try:
+        return (float(match.group(1)), float(match.group(2)),
+                float(match.group(3).replace(",", "")))
+    except ValueError:
+        return None, None, None
+
+
+def _whole(value):
+    """A number that is whole is written without the '.0'."""
+    return int(value) if isinstance(value, float) and value.is_integer() else value
+
+
+def build_laser_report(template_bytes: bytes, dig: Dig, sheet: str,
+                       profile_number: Optional[int] = None) -> tuple:
+    """Return (.xlsx bytes, warnings): the laser template with its heading filled.
+
+    Only the input sheet's heading is written; the other sheets read from it.
+    Dates, technician and exposed length are not on the dig sheet and keep the
+    template's placeholders.
+    """
+    info = asset_info(dig)
+    warnings = _asset_warnings(info)
+
+    patcher = XlsmPatcher(template_bytes)
+    names = patcher.sheet_names()
+    if sheet not in names:
+        raise ValueError(f"The laser template has no '{sheet}' sheet - found {', '.join(names)}.")
+
+    outer, wall, smys = pipe_size(dig)
+    if outer is None:
+        warnings.append("Pipe size, wall and SMYS could not be read from the dig sheet's Size line.")
+
+    def number_or_text(value):
+        found = _number(value)
+        return _whole(found) if found is not None else (value or None)
+
+    cells = {
+        "B2": number_or_text(info.line_id),
+        "E2": number_or_text(info.assessment_id),
+        "H2": info.segment_name or None,
+        "B3": info.dig_number or None,
+        "B4": _whole(outer), "E4": _whole(wall), "H4": _whole(smys),
+    }
+    if profile_number is not None:
+        cells["P1"] = profile_number
+    cells = {ref: value for ref, value in cells.items() if value is not None}
+
+    missing = patcher.set_values(sheet, cells, literal=True)
+    if missing:
+        warnings.append("Could not place these laser cells: " + ", ".join(sorted(missing)))
+    patcher.force_full_recalc()
+    return patcher.to_bytes(), warnings
+
+
+def laser_consistency_name(dig: Dig, profile_number: int) -> str:
+    return (f"{folder_for(dig)}/{LASER_FOLDER}/"
+            f"Laser Consistency Check_Dig #{_file_part(dig.number)}_Profile {profile_number}.xlsx")
+
+
+def laser_movement_name(dig: Dig) -> str:
+    return (f"{folder_for(dig)}/{LASER_FOLDER}/"
+            f"Laser Pipe Movement_Dig #{_file_part(dig.number)}.xlsx")
+
+
 def generate_files(
     digs: list,
     template_bytes: bytes,
@@ -3750,6 +3838,9 @@ def generate_files(
     excavation_template: Optional[bytes] = None,
     profile_template: Optional[bytes] = None,
     as_built_template: Optional[bytes] = None,
+    laser: bool = False,
+    laser_consistency_template: Optional[bytes] = None,
+    laser_movement_template: Optional[bytes] = None,
 ) -> tuple:
     """Return ({path: bytes}, [issues]) for the chosen digs.
 
@@ -3808,7 +3899,34 @@ def generate_files(
             except Exception as error:  # noqa: BLE001
                 issues.append(f"{dig.name} (AID {dig.package_id}): excavation report failed - {error}")
 
-        if profile_template:
+        if laser:
+            # The laser workbooks stand in for the profile report: three consistency
+            # checks (Profile 0, 1, 2, each carrying its own number) and one movement.
+            tick((index - 0.05) / total, f"{dig.name} (AID {dig.package_id}) - laser reports")
+            laser_warnings = []
+            if laser_consistency_template:
+                for number in LASER_PROFILES:
+                    try:
+                        book, found = build_laser_report(
+                            laser_consistency_template, dig, LASER_CONSISTENCY_SHEET, number)
+                        outputs[laser_consistency_name(dig, number)] = book
+                        laser_warnings = found
+                    except Exception as error:  # noqa: BLE001
+                        issues.append(f"{dig.name} (AID {dig.package_id}): laser consistency "
+                                      f"check Profile {number} failed - {error}")
+            if laser_movement_template:
+                try:
+                    book, found = build_laser_report(
+                        laser_movement_template, dig, LASER_MOVEMENT_SHEET)
+                    outputs[laser_movement_name(dig)] = book
+                    laser_warnings = found
+                except Exception as error:  # noqa: BLE001
+                    issues.append(f"{dig.name} (AID {dig.package_id}): laser pipe movement "
+                                  f"failed - {error}")
+            if not excavation_template:
+                issues.extend(f"{dig.name} (AID {dig.package_id}): {w}" for w in laser_warnings)
+
+        if profile_template and not laser:
             tick((index - 0.05) / total, f"{dig.name} (AID {dig.package_id}) - profile")
             try:
                 sheet, sheet_warnings = build_profile_report(profile_template, dig)
@@ -3921,6 +4039,28 @@ def main() -> None:
         "As-Built template (.vsdx) - optional", type=["vsdx"], key="as_built",
         help="Enterprise's As-Built drawing. One is filled for every dig, in an As-Builts folder.",
     )
+    use_laser = st.checkbox(
+        "Are you using a robotic laser to profile with?", key="use_laser",
+        help="Replaces the profile report with Enterprise's laser workbooks: three "
+             "Consistency Checks (Profile 0, 1, 2) and one Pipe Movement Calculation "
+             "per dig, in a Laser Reports folder.",
+    )
+    laser_check_file = laser_move_file = None
+    if use_laser:
+        laser_left, laser_right = st.columns(2)
+        with laser_left:
+            laser_check_file = st.file_uploader(
+                "Laser Consistency Check template (.xlsx)", type=["xlsx"], key="laser_check",
+                help="Made three times per dig, as Profile 0, Profile 1 and Profile 2.",
+            )
+        with laser_right:
+            laser_move_file = st.file_uploader(
+                "Laser Pipe Movement Calculation template (.xlsx)", type=["xlsx"],
+                key="laser_move", help="Made once per dig.",
+            )
+        if laser_check_file is None or laser_move_file is None:
+            st.info("Upload both laser templates; the usual profile report is not made "
+                    "while this box is ticked.")
     if excavation_file is not None:
         try:
             from pypdf import PdfReader
@@ -4130,6 +4270,9 @@ def main() -> None:
             excavation_template=excavation_file.getvalue() if excavation_file else None,
             profile_template=profile_file.getvalue() if profile_file else None,
             as_built_template=as_built_file.getvalue() if as_built_file else None,
+            laser=bool(use_laser),
+            laser_consistency_template=laser_check_file.getvalue() if laser_check_file else None,
+            laser_movement_template=laser_move_file.getvalue() if laser_move_file else None,
         )
         bar.empty()
         st.session_state.outputs = outputs
