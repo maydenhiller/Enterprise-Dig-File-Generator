@@ -4125,8 +4125,15 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Read the uploads
     # ------------------------------------------------------------------
-    run_clicked = st.button("Generate files", type="primary", disabled=not ready)
-    if run_clicked:
+    # The packages are read as soon as they are uploaded, so the table below is
+    # there to fill in before Generate is pressed.
+    read_signature = (
+        tuple((u.name, u.size) for u in package_files or []),
+        (kmz_file.name, kmz_file.size) if kmz_file is not None else None,
+        bool(make_aerial),
+    )
+    if ready and st.session_state.get("read_signature") != read_signature:
+        st.session_state.read_signature = read_signature
         # Notes typed in the table survive the re-read.
         old_notes = {(d.package_id, d.name): d.notes
                      for d in (st.session_state.digs or []) if d.notes}
@@ -4249,7 +4256,7 @@ def main() -> None:
             "are fetched one dig at a time, so this takes a few minutes."
         )
 
-    if run_clicked:
+    if st.button("Generate files", type="primary"):
         cheat_templates = {}
         for upload in cheat_files:
             flavour = cheat_sheet_flavour(upload.getvalue())
