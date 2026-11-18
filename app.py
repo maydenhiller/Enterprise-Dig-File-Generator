@@ -4127,6 +4127,9 @@ def main() -> None:
     # ------------------------------------------------------------------
     run_clicked = st.button("Generate files", type="primary", disabled=not ready)
     if run_clicked:
+        # Notes typed in the table survive the re-read.
+        old_notes = {(d.package_id, d.name): d.notes
+                     for d in (st.session_state.digs or []) if d.notes}
         digs, problems = [], []
         with st.status("Reading dig packages...", expanded=False):
             for upload in package_files:
@@ -4149,6 +4152,8 @@ def main() -> None:
             except Exception as error:  # noqa: BLE001
                 problems.append(f"{kmz_file.name}: {error}")
         reconcile_with_kmz(digs, pipeline)
+        for dig in digs:
+            dig.notes = old_notes.get((dig.package_id, dig.name), "")
         if make_aerial and (pipeline is None or not pipeline.lines):
             problems.append(
                 "No pipeline centerline loaded, so the aerial images will show the "
@@ -4178,12 +4183,62 @@ def main() -> None:
         _downloads(st)
         return
 
-    # One button reads the packages and generates everything; anything that
-    # went wrong is simply listed.
+    # ------------------------------------------------------------------
+    # Review
+    # ------------------------------------------------------------------
+    packages = sorted({d.package_id for d in digs})
+    st.subheader(f"{len(digs)} dig sheets found in {len(packages)} package"
+                 f"{'s' if len(packages) != 1 else ''}")
+
+    shown = digs
+    st.caption(
+        "Every dig below is generated. Everything comes straight from the dig "
+        "package - fix a wrong value in the package, not here."
+    )
+
+    table_key = "review"
+    edited = st.data_editor(
+        [
+            {
+                "AID": dig.package_id,
+                "Dig": dig.name,
+                "ODO": dig.odometer,
+                "Station": station_label(dig.station_ft),
+                "U/S ref": dig.upstream_reference,
+                "U/S ft": _round2(dig.us_ref_distance),
+                "D/S ref": dig.downstream_reference,
+                "D/S ft": _round2(dig.ds_ref_distance),
+                "County": dig.county_state,
+                "Tract": dig.tract_number,
+                "Alignment sheet": dig.alignment_sheet,
+                "HCA": dig.hca,
+                "Notes": dig.notes,
+            }
+            for dig in shown
+        ],
+        width="stretch",
+        num_rows="fixed",
+        key=table_key,
+        disabled=[c for c in ("AID", "Dig", "ODO", "Station", "U/S ref", "U/S ft",
+                              "D/S ref", "D/S ft", "County", "Tract",
+                              "Alignment sheet", "HCA")],
+        column_config={
+            "Notes": st.column_config.TextColumn(
+                "Cheat sheet notes",
+                help="Goes in the Notes column of the cheat sheet.",
+            ),
+        },
+    )
+
+    warnings = [(d.name, d.package_id, w) for d in shown for w in d.warnings]
+    if warnings:
+        with st.expander(f"{len(warnings)} thing(s) to check", expanded=len(warnings) <= 12):
+            for name, package_id, warning in warnings:
+                st.write(f"**{name}** (AID {package_id}) - {warning}")
+
     selected = list(digs)
-    for dig in selected:
-        for warning in dig.warnings:
-            st.warning(f"{dig.name} (AID {dig.package_id}) - {warning}")
+    for row, dig in zip(edited, shown):
+        dig.notes = row.get("Notes") or ""
 
     # ------------------------------------------------------------------
     # Generate
