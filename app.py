@@ -4125,7 +4125,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Read the uploads
     # ------------------------------------------------------------------
-    if st.button("Read uploads", type="primary", disabled=not ready):
+    run_clicked = st.button("Generate files", type="primary", disabled=not ready)
+    if run_clicked:
         digs, problems = [], []
         with st.status("Reading dig packages...", expanded=False):
             for upload in package_files:
@@ -4177,62 +4178,12 @@ def main() -> None:
         _downloads(st)
         return
 
-    # ------------------------------------------------------------------
-    # Review
-    # ------------------------------------------------------------------
-    packages = sorted({d.package_id for d in digs})
-    st.subheader(f"{len(digs)} dig sheets found in {len(packages)} package"
-                 f"{'s' if len(packages) != 1 else ''}")
-
-    shown = digs
-    st.caption(
-        "Every dig below is generated. Everything comes straight from the dig "
-        "package - fix a wrong value in the package, not here."
-    )
-
-    table_key = "review"
-    edited = st.data_editor(
-        [
-            {
-                "AID": dig.package_id,
-                "Dig": dig.name,
-                "ODO": dig.odometer,
-                "Station": station_label(dig.station_ft),
-                "U/S ref": dig.upstream_reference,
-                "U/S ft": _round2(dig.us_ref_distance),
-                "D/S ref": dig.downstream_reference,
-                "D/S ft": _round2(dig.ds_ref_distance),
-                "County": dig.county_state,
-                "Tract": dig.tract_number,
-                "Alignment sheet": dig.alignment_sheet,
-                "HCA": dig.hca,
-                "Notes": dig.notes,
-            }
-            for dig in shown
-        ],
-        width="stretch",
-        num_rows="fixed",
-        key=table_key,
-        disabled=[c for c in ("AID", "Dig", "ODO", "Station", "U/S ref", "U/S ft",
-                              "D/S ref", "D/S ft", "County", "Tract",
-                              "Alignment sheet", "HCA")],
-        column_config={
-            "Notes": st.column_config.TextColumn(
-                "Cheat sheet notes",
-                help="Goes in the Notes column of the cheat sheet.",
-            ),
-        },
-    )
-
-    warnings = [(d.name, d.package_id, w) for d in shown for w in d.warnings]
-    if warnings:
-        with st.expander(f"{len(warnings)} thing(s) to check", expanded=len(warnings) <= 12):
-            for name, package_id, warning in warnings:
-                st.write(f"**{name}** (AID {package_id}) - {warning}")
-
+    # One button reads the packages and generates everything; anything that
+    # went wrong is simply listed.
     selected = list(digs)
-    for row, dig in zip(edited, shown):
-        dig.notes = row.get("Notes") or ""
+    for dig in selected:
+        for warning in dig.warnings:
+            st.warning(f"{dig.name} (AID {dig.package_id}) - {warning}")
 
     # ------------------------------------------------------------------
     # Generate
@@ -4243,7 +4194,7 @@ def main() -> None:
             "are fetched one dig at a time, so this takes a few minutes."
         )
 
-    if st.button(f"Generate files for all {len(selected)} digs", type="primary"):
+    if run_clicked:
         cheat_templates = {}
         for upload in cheat_files:
             flavour = cheat_sheet_flavour(upload.getvalue())
@@ -4278,8 +4229,10 @@ def main() -> None:
         st.session_state.outputs = outputs
         st.session_state.zip_path = None
         st.session_state.generated = [d.key for d in selected]
-        for issue in issues:
-            st.warning(issue)
+        st.session_state.issues = issues
+
+    for issue in st.session_state.get("issues") or []:
+        st.warning(issue)
 
     _downloads(st)
 
